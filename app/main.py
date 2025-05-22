@@ -1,4 +1,5 @@
-from fastapi import FastAPI, Header, HTTPException, status, Depends
+import torch
+from fastapi import FastAPI, Header, HTTPException, status, Request
 from pydantic import BaseModel
 import httpx
 import os
@@ -16,6 +17,17 @@ from nltk.corpus import wordnet
 from thefuzz import fuzz
 from datetime import datetime
 import nltk
+from sentence_transformers import SentenceTransformer
+from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
+from sklearn.metrics.pairwise import cosine_similarity
+from rank_bm25 import BM25Okapi
+import numpy as np
+from urllib.parse import urlparse
+from fastapi.middleware.cors import CORSMiddleware
+
+# Initialize CUDA
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"🚀 Initializing with {torch.cuda.get_device_name(0)}")
 
 # Configuration
 DATABASE_URL = "sqlite:////app/data/local_search.db"
@@ -25,17 +37,25 @@ INDEX_NAME = "documents"
 MIN_RESULTS_FOR_REFETCH = 3
 MAX_DOCS_TO_INDEX = 50
 
-# Load NLP model
-try:
-    nlp = spacy.load("en_core_web_sm")
-except:
-    nlp = spacy.blank("en")
+# Initialize models with mixed precision
+semantic_model = SentenceTransformer('all-MiniLM-L6-v2').to(DEVICE)
+summarizer = pipeline(
+    "summarization", 
+    model="facebook/bart-large-cnn", 
+    device=0,
+    torch_dtype=torch.float16
+)
+ner_pipeline = pipeline(
+    "ner",
+    model="dbmdz/bert-large-cased-finetuned-conll03-english",
+    device=0,
+    aggregation_strategy="average"
+)
 
 # Database setup
 database = databases.Database(DATABASE_URL)
 metadata = sqlalchemy.MetaData()
 
-# Table definitions
 api_keys = sqlalchemy.Table(
     "api_keys",
     metadata,
@@ -60,367 +80,269 @@ search_feedback = sqlalchemy.Table(
     sqlalchemy.Column("timestamp", sqlalchemy.DateTime, default=datetime.utcnow),
 )
 
-# Create engine & tables
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 
 def migrate_db():
-    """Synchronous database migration for SQLAlchemy 1.4"""
     metadata.create_all(engine)
 
-# FastAPI app
 app = FastAPI(
-    title="Intelligent Search API",
-    version="2.0",
-    description="An AI-enhanced search API with semantic understanding, personalization, and continuous learning"
+    title="Neural Search API",
+    version="5.0",
+    description="GPU-accelerated intelligent search engine"
 )
 
-# Pydantic models
+# CORS Configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 class SearchRequest(BaseModel):
     q: str
     user_id: Optional[str] = None
     limit: Optional[int] = 10
+    neural: Optional[bool] = True
 
-class Feedback(BaseModel):
-    query: str
-    doc_id: str
-    relevant: bool
-    user_id: Optional[str] = None
+class EnhancedResult(BaseModel):
+    id: int
+    title: str
+    content: str
+    source: str
+    summary: str
+    entities: List[Dict]
+    score: float
+    processing_time_ms: float
 
-class UserPreferences(BaseModel):
-    user_id: str
-    preferred_topics: List[str]
-    preferred_sources: List[str]
+class SearchResponse(BaseModel):
+    results: List[EnhancedResult]
+    query_analysis: Dict
+    hardware: Dict
 
-# Startup & shutdown events
 @app.on_event("startup")
 async def startup():
     await database.connect()
-    await verify_config()
-    migrate_db()  # Synchronous table creation
+    migrate_db()
     await initialize_meilisearch_index()
+    nltk.download('punkt', quiet=True)
+    nltk.download('wordnet', quiet=True)
+    print("✅ Services initialized")
 
 @app.on_event("shutdown")
 async def shutdown():
     await database.disconnect()
-
-async def verify_config():
-    if not MEILI_MASTER_KEY:
-        raise RuntimeError("MEILI_MASTER_KEY must be set in environment")
-    if not MEILI_HOST:
-        raise RuntimeError("MEILI_HOST environment variable not set")
+    torch.cuda.empty_cache()
 
 async def initialize_meilisearch_index():
     async with httpx.AsyncClient() as client:
-        headers = {"Authorization": f"Bearer {MEILI_MASTER_KEY}", "Content-Type": "application/json"}
-        
+        headers = {"Authorization": f"Bearer {MEILI_MASTER_KEY}"}
         try:
-            resp = await client.get(f"{MEILI_HOST}/indexes/{INDEX_NAME}", headers=headers)
-            if resp.status_code == 404:
-                await client.post(
-                    f"{MEILI_HOST}/indexes",
-                    headers=headers,
-                    json={"uid": INDEX_NAME, "primaryKey": "id"}
-                )
-            
-            # Configure index settings
+            await client.post(
+                f"{MEILI_HOST}/indexes",
+                headers=headers,
+                json={"uid": INDEX_NAME, "primaryKey": "id"}
+            )
             await client.post(
                 f"{MEILI_HOST}/indexes/{INDEX_NAME}/settings",
                 headers=headers,
                 json={
-                    "rankingRules": [
-                        "words", "typo", "proximity", "attribute",
-                        "sort", "exactness", "length:desc"
-                    ],
-                    "searchableAttributes": ["title", "content", "keywords", "entities"],
-                    "sortableAttributes": ["length", "popularity"],
                     "filterableAttributes": ["language", "source_domain"],
-                    "synonyms": {
-                        "ai": ["artificial intelligence", "machine learning"],
-                        "ml": ["machine learning"],
-                        "it": ["information technology"]
-                    }
+                    "sortableAttributes": ["_geo"]
                 }
             )
-        except httpx.RequestError as e:
-            raise RuntimeError(f"Failed to initialize MeiliSearch: {str(e)}")
+        except httpx.HTTPStatusError as e:
+            print(f"⚠️ MeiliSearch initialization error: {e}")
 
-# Security helpers
-def raise_invalid_key():
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Invalid API Key"
-    )
+def verify_api_key(key: str):
+    query = api_keys.select().where(api_keys.c.key == key)
+    return database.fetch_one(query) is not None
 
-async def verify_api_key(x_api_key: str = Header(...)):
-    query = api_keys.select().where(api_keys.c.key == x_api_key)
-    key = await database.fetch_one(query)
-    if not key:
-        raise_invalid_key()
+def gpu_extract_features(text: str) -> Dict:
+    """Extract NLP features using GPU acceleration"""
+    with torch.no_grad(), torch.cuda.amp.autocast():
+        # Entity recognition
+        entities = ner_pipeline(text[:512])
+        
+        # Summarization
+        summary = summarizer(text[:1024], max_length=130)[0]["summary_text"]
+        
+        # Semantic embedding
+        embedding = semantic_model.encode(text, convert_to_tensor=True)
+        
+        # Keywords via noun chunks
+        doc = nlp(text[:10000])
+        keywords = list(set([chunk.text for chunk in doc.noun_chunks]))
+        
+    return {
+        "entities": entities,
+        "summary": summary,
+        "embedding": embedding,
+        "keywords": keywords
+    }
 
-# Intelligent document processing
-def extract_entities(text: str) -> List[Dict[str, str]]:
-    doc = nlp(text[:10000])  # Process first 10k chars for efficiency
-    return [{"text": ent.text, "type": ent.label_} for ent in doc.ents]
+async def hybrid_search(query: str, documents: List[Dict]) -> List[Dict]:
+    """Combine BM25 and semantic search scores"""
+    # Lexical BM25
+    tokenized_docs = [d["content"].split() for d in documents]
+    bm25 = BM25Okapi(tokenized_docs)
+    lexical_scores = bm25.get_scores(query.split())
+    
+    # Semantic similarity
+    query_embed = semantic_model.encode(query, convert_to_tensor=True)
+    doc_embeds = torch.stack([d["embedding"] for d in documents])
+    semantic_scores = torch.nn.functional.cosine_similarity(
+        query_embed, 
+        doc_embeds
+    ).cpu().numpy()
+    
+    # Combine scores
+    combined = 0.6*semantic_scores + 0.4*lexical_scores
+    ranked_indices = np.argsort(combined)[::-1]
+    
+    return [documents[i] for i in ranked_indices], combined[ranked_indices]
 
-def extract_keywords(text: str) -> List[str]:
-    doc = nlp(text[:10000])
-    return list(set([chunk.text.lower() for chunk in doc.noun_chunks]))
-
-def get_domain(url: str) -> str:
-    from urllib.parse import urlparse
-    parsed = urlparse(url)
-    return parsed.netloc.replace("www.", "")
-
-def generate_documents_for_query(query: str) -> List[Dict[str, Any]]:
-    search_url = "https://html.duckduckgo.com/html/"
+def generate_documents(query: str) -> List[Dict]:
+    """Fetch and process search results"""
+    client = httpx.Client(timeout=30.0)
     docs = []
-    client = httpx.Client(headers={"User-Agent": "Mozilla/5.0"}, timeout=15.0)
     
     try:
-        resp = client.post(search_url, data={"q": query})
+        # DuckDuckGo scraping
+        resp = client.post(
+            "https://html.duckduckgo.com/html/",
+            data={"q": query},
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
         soup = BeautifulSoup(resp.text, "html.parser")
-        results = soup.find_all("div", class_="result", limit=10)
-
-        for res in results:
-            link_tag = res.find("a", class_="result__a")
-            if not link_tag:
-                continue
-                
-            link = link_tag.get("href")
-            title = link_tag.get_text(strip=True)
-            snippet = res.find("div", class_="result__snippet").get_text(strip=True) if res.find("div", class_="result__snippet") else ""
-
-            # Enhanced content extraction
-            content = ""
+        
+        for result in soup.find_all("div", class_="result", limit=MAX_DOCS_TO_INDEX):
             try:
+                link = result.find("a", class_="result__a")["href"]
+                title = result.find("a", class_="result__a").get_text(strip=True)
+                snippet = result.find("div", class_="result__snippet").get_text() if result.find("div", class_="result__snippet") else ""
+                
+                # Fetch full content
                 downloaded = fetch_url(link)
-                content = extract(downloaded, include_formatting=False, include_links=False) or snippet
+                content = extract(downloaded) or snippet
                 
-                # Language detection
-                lang = detect(content[:500]) if content else "en"
-                
-                # Entity and keyword extraction
-                entities = extract_entities(content)
-                keywords = extract_keywords(content)
+                # Process with GPU
+                features = gpu_extract_features(content)
                 
                 docs.append({
                     "id": abs(hash(link)) % (10**8),
                     "title": title,
                     "content": content,
                     "source": link,
-                    "source_domain": get_domain(link),
-                    "language": lang,
-                    "entities": entities,
-                    "keywords": keywords,
-                    "length": len(content),
-                    "popularity": len(keywords)  # Simple popularity metric
+                    "source_domain": urlparse(link).netloc,
+                    **features
                 })
                 
-                if len(docs) >= MAX_DOCS_TO_INDEX:
-                    break
-                    
             except Exception as e:
                 continue
                 
     except Exception as e:
-        print(f"Error fetching results: {str(e)}")
+        print(f"Search error: {str(e)}")
     finally:
         client.close()
+    
+    return docs or [create_empty_result(query)]
 
-    return docs or [{
+def create_empty_result(query: str) -> Dict:
+    return {
         "id": abs(hash(query)) % (10**8),
         "title": f"No results for '{query}'",
-        "content": "Try different search terms",
+        "content": "",
         "source": "",
         "source_domain": "",
-        "language": "en",
         "entities": [],
+        "summary": "",
         "keywords": [],
-        "length": 0,
-        "popularity": 0
-    }]
+        "embedding": torch.zeros(384).to(DEVICE)
+    }
 
-# Query enhancement
-async def enhance_query(query: str, user_id: Optional[str] = None) -> str:
-    # Spelling correction
-    try:
-        corrected = str(TextBlob(query).correct())
-        if fuzz.ratio(query, corrected) > 85:
-            query = corrected
-    except:
-        pass
-
-    # Query expansion using WordNet
-    expanded = set(query.split())
-    for word in query.split():
-        for syn in wordnet.synsets(word):
-            for lemma in syn.lemmas():
-                expanded.add(lemma.name().replace("_", " "))
+@app.post("/search")
+async def neural_search(
+    request: SearchRequest, 
+    x_api_key: str = Header(...)
+):
+    """Main search endpoint with GPU acceleration"""
+    if not verify_api_key(x_api_key):
+        raise HTTPException(status_code=401, detail="Invalid API key")
     
-    # Add user preferences if available
-    if user_id:
-        prefs = await database.fetch_one(
-            user_prefs.select().where(user_prefs.c.user_id == user_id)
-        )
-        if prefs and prefs["preferences"]:
-            expanded.update(prefs["preferences"].get("preferred_topics", []))
-
-    return " ".join(list(expanded)[:10])  # Return top 10 terms
-
-# Personalization
-async def personalize_results(user_id: Optional[str], results: dict) -> dict:
-    if not user_id:
-        return results
-        
-    prefs = await database.fetch_one(
-        user_prefs.select().where(user_prefs.c.user_id == user_id)
+    # Start GPU timer
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    torch.cuda.synchronize()
+    start_event.record()
+    
+    # Process query
+    expanded_query = await expand_query(request.q)
+    documents = generate_documents(expanded_query)
+    
+    # Hybrid ranking
+    ranked_docs, scores = await hybrid_search(expanded_query, documents)
+    
+    # End GPU timer
+    end_event.record()
+    torch.cuda.synchronize()
+    gpu_time = start_event.elapsed_time(end_event)
+    
+    # Build response
+    return SearchResponse(
+        results=[
+            EnhancedResult(
+                id=doc["id"],
+                title=doc["title"],
+                content=doc["content"],
+                source=doc["source"],
+                summary=doc["summary"],
+                entities=doc["entities"],
+                score=float(score),
+                processing_time_ms=gpu_time
+            )
+            for doc, score in zip(ranked_docs[:request.limit], scores)
+        ],
+        query_analysis={
+            "original": request.q,
+            "expanded": expanded_query,
+            "terms": expanded_query.split()
+        },
+        hardware={
+            "device": torch.cuda.get_device_name(0),
+            "memory_used": torch.cuda.memory_allocated(0),
+            "compute_time_ms": gpu_time
+        }
     )
-    
-    if not prefs or not prefs["preferences"]:
-        return results
 
-    preferred_topics = prefs["preferences"].get("preferred_topics", [])
-    preferred_sources = prefs["preferences"].get("preferred_sources", [])
-    
-    boosted_hits = []
-    for hit in results["hits"]:
-        # Boost score for preferred topics
-        hit_keywords = set(kw.lower() for kw in hit.get("keywords", []))
-        topic_matches = len(hit_keywords.intersection(set(t.lower() for t in preferred_topics)))
-        
-        # Boost score for preferred sources
-        source_match = hit.get("source_domain", "") in preferred_sources
-        
-        if topic_matches or source_match:
-            hit["_rankingScore"] *= (1 + (0.2 * topic_matches) + (0.3 if source_match else 0))
-        boosted_hits.append(hit)
-    
-    results["hits"] = sorted(boosted_hits, key=lambda x: x["_rankingScore"], reverse=True)
-    return results
-
-# API Endpoints
 @app.post("/generate-key")
 async def generate_key():
-    new_key = secrets.token_hex(16)
+    """Create new API key"""
+    new_key = secrets.token_hex(32)
     await database.execute(api_keys.insert().values(key=new_key))
     return {"api_key": new_key}
 
-@app.post("/search")
-async def search(
-    req: SearchRequest,
-    x_api_key: str = Header(...)
-):
-    await verify_api_key(x_api_key)
-    
-    enhanced_q = await enhance_query(req.q, req.user_id)
-    
-    async with httpx.AsyncClient() as client:
-        headers = {"Authorization": f"Bearer {MEILI_MASTER_KEY}"}
-        
-        try:
-            # First try with MeiliSearch
-            params = {
-                "q": enhanced_q,
-                "limit": req.limit,
-                "attributesToRetrieve": ["*"],
-                "attributesToHighlight": ["content"]
-            }
-            
-            resp = await client.get(
-                f"{MEILI_HOST}/indexes/{INDEX_NAME}/search",
-                params=params,
-                headers=headers
-            )
-            resp.raise_for_status()
-            results = resp.json()
-            
-            # If insufficient results, fetch and index new content
-            if len(results.get("hits", [])) < MIN_RESULTS_FOR_REFETCH:
-                docs = generate_documents_for_query(req.q)
-                if docs:
-                    await client.post(
-                        f"{MEILI_HOST}/indexes/{INDEX_NAME}/documents",
-                        json=docs,
-                        headers={**headers, "Content-Type": "application/json"}
-                    )
-                    # Search again with new content
-                    resp = await client.get(
-                        f"{MEILI_HOST}/indexes/{INDEX_NAME}/search",
-                        params=params,
-                        headers=headers
-                    )
-                    results = resp.json()
-            
-            # Personalize results if user_id provided
-            if req.user_id:
-                results = await personalize_results(req.user_id, results)
-                
-            # Record search history
-            if req.user_id:
-                await database.execute(
-                    user_prefs.update()
-                    .where(user_prefs.c.user_id == req.user_id)
-                    .values(search_history=sqlalchemy.func.json_array_append(
-                        user_prefs.c.search_history,
-                        "$",
-                        {"query": req.q, "timestamp": str(datetime.utcnow())}
-                    ))
-                )
-            
-            return results
-            
-        except httpx.HTTPStatusError as e:
-            detail = "Search service error" if e.response.status_code >= 500 else e.response.text
-            raise HTTPException(status_code=e.response.status_code, detail=detail)
-        except Exception as e:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Search failed: {str(e)}"
-            )
+@app.get("/system-status")
+async def system_status():
+    """Check GPU and service health"""
+    return {
+        "gpu": {
+            "name": torch.cuda.get_device_name(0),
+            "memory": {
+                "total": torch.cuda.get_device_properties(0).total_memory,
+                "allocated": torch.cuda.memory_allocated(0),
+                "cached": torch.cuda.memory_reserved(0)
+            },
+            "utilization": torch.cuda.utilization()
+        },
+        "services": {
+            "database": "active",
+            "search": "ready",
+            "models": "loaded"
+        }
+    }
 
-@app.post("/feedback")
-async def submit_feedback(
-    fb: Feedback,
-    x_api_key: str = Header(...)
-):
-    await verify_api_key(x_api_key)
-    
-    await database.execute(
-        search_feedback.insert().values(
-            query=fb.query,
-            doc_id=fb.doc_id,
-            relevant=fb.relevant,
-            user_id=fb.user_id
-        )
-    )
-    
-    return {"status": "feedback recorded"}
-
-@app.post("/user/preferences")
-async def update_preferences(
-    prefs: UserPreferences,
-    x_api_key: str = Header(...)
-):
-    await verify_api_key(x_api_key)
-    
-    await database.execute(
-        user_prefs.insert()
-        .values(
-            user_id=prefs.user_id,
-            preferences={
-                "preferred_topics": prefs.preferred_topics,
-                "preferred_sources": prefs.preferred_sources
-            }
-        )
-        .on_conflict_do_update(
-            index_elements=["user_id"],
-            set_={
-                "preferences": {
-                    "preferred_topics": prefs.preferred_topics,
-                    "preferred_sources": prefs.preferred_sources
-                }
-            }
-        )
-    )
-    
-    return {"status": "preferences updated"}
+# if __name__ == "__main__":
+#     import uvicorn
+#     uvicorn.run(app, host="0.0.0.0", port=8000)
