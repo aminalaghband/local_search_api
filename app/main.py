@@ -182,85 +182,144 @@ def gpu_extract_features(text: str) -> Dict:
         "keywords": keywords
     }
 
-async def hybrid_search(query: str, documents: List[Dict]) -> List[Dict]:
-    """Combine BM25 and semantic search scores"""
-    # Lexical BM25
-    tokenized_docs = [d["content"].split() for d in documents]
-    bm25 = BM25Okapi(tokenized_docs)
-    lexical_scores = bm25.get_scores(query.split())
+async def hybrid_search(query: str, documents: List[Dict]) -> Tuple[List[Dict], List[float]]:
+    """Safe implementation of hybrid search with empty document handling"""
+    if not documents:
+        return [], []
     
-    # Semantic similarity
-    query_embed = semantic_model.encode(query, convert_to_tensor=True)
-    doc_embeds = torch.stack([d["embedding"] for d in documents])
-    semantic_scores = torch.nn.functional.cosine_similarity(
-        query_embed, 
-        doc_embeds
-    ).cpu().numpy()
+    # Filter out empty documents
+    valid_docs = [d for d in documents if d.get("content")]
+    if not valid_docs:
+        return [], []
     
-    # Combine scores
-    combined = 0.6*semantic_scores + 0.4*lexical_scores
-    ranked_indices = np.argsort(combined)[::-1]
+    # Tokenize documents
+    tokenized_docs = [doc["content"].split() for doc in valid_docs]
+    tokenized_docs = [doc for doc in tokenized_docs if doc]  # Remove empty token lists
     
-    return [documents[i] for i in ranked_indices], combined[ranked_indices]
-
-def generate_documents(query: str) -> List[Dict]:
-    """Fetch and process search results"""
-    client = httpx.Client(timeout=30.0)
-    docs = []
+    # If no valid tokens, return empty results
+    if not tokenized_docs:
+        return [], []
     
+    # Proceed with BM25 and semantic search
     try:
-        # DuckDuckGo scraping
-        resp = client.post(
-            "https://html.duckduckgo.com/html/",
-            data={"q": query},
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-        soup = BeautifulSoup(resp.text, "html.parser")
+        bm25 = BM25Okapi(tokenized_docs)
+        lexical_scores = bm25.get_scores(query.split())
         
-        for result in soup.find_all("div", class_="result", limit=MAX_DOCS_TO_INDEX):
+        query_embed = semantic_model.encode(query, convert_to_tensor=True)
+        doc_embeds = torch.stack([doc["embedding"] for doc in valid_docs])
+        semantic_scores = torch.nn.functional.cosine_similarity(
+            query_embed, 
+            doc_embeds
+        ).cpu().numpy()
+        
+        combined = 0.6*semantic_scores + 0.4*lexical_scores
+        ranked_indices = np.argsort(combined)[::-1]
+        
+        return [valid_docs[i] for i in ranked_indices], combined[ranked_indices]
+    except Exception as e:
+        print(f"Search error: {str(e)}")
+        return [], []
+
+def generate_documents(query: str) -> List[Dict[str, Any]]:
+    """Generate search documents with robust error handling and content validation"""
+    search_url = "https://html.duckduckgo.com/html/"
+    docs = []
+    client = httpx.Client(
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=30.0,
+        follow_redirects=True
+    )
+
+    try:
+        # Fetch search results
+        resp = client.post(search_url, data={"q": query})
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        results = soup.find_all("div", class_="result", limit=10)
+
+        for res in results:
             try:
-                link = result.find("a", class_="result__a")["href"]
-                title = result.find("a", class_="result__a").get_text(strip=True)
-                snippet = result.find("div", class_="result__snippet").get_text() if result.find("div", class_="result__snippet") else ""
+                # Extract basic info
+                link_tag = res.find("a", class_="result__a")
+                if not link_tag:
+                    continue
                 
-                # Fetch full content
-                downloaded = fetch_url(link)
-                content = extract(downloaded) or snippet
-                
+                link = link_tag.get("href", "")
+                title = link_tag.get_text(strip=True)
+                snippet = res.find("div", class_="result__snippet")
+                snippet = snippet.get_text(strip=True) if snippet else ""
+
+                # Fetch and process full content
+                content = ""
+                try:
+                    downloaded = fetch_url(link, timeout=5.0)
+                    if downloaded:
+                        content = extract(
+                            downloaded,
+                            include_formatting=False,
+                            include_links=False,
+                            include_tables=False
+                        ) or snippet
+                except Exception as e:
+                    content = snippet
+                    print(f"Content extraction failed for {link}: {str(e)}")
+
+                # Ensure minimum content requirements
+                if not content.strip():
+                    content = snippet if snippet else "No content available"
+
                 # Process with GPU
                 features = gpu_extract_features(content)
                 
                 docs.append({
                     "id": abs(hash(link)) % (10**8),
-                    "title": title,
-                    "content": content,
+                    "title": title[:500],  # Limit title length
+                    "content": content[:10000],  # Limit content length
                     "source": link,
-                    "source_domain": urlparse(link).netloc,
+                    "source_domain": get_domain(link),
                     **features
                 })
-                
+
+                if len(docs) >= MAX_DOCS_TO_INDEX:
+                    break
+
             except Exception as e:
+                print(f"Error processing result: {str(e)}")
                 continue
-                
+
     except Exception as e:
-        print(f"Search error: {str(e)}")
+        print(f"Search failed: {str(e)}")
     finally:
         client.close()
-    
-    return docs or [create_empty_result(query)]
 
-def create_empty_result(query: str) -> Dict:
+    # Return empty result if no documents found
+    return docs if docs else [create_empty_result(query)]
+
+def create_empty_result(query: str) -> Dict[str, Any]:
+    """Create a placeholder result for empty searches"""
     return {
         "id": abs(hash(query)) % (10**8),
         "title": f"No results for '{query}'",
-        "content": "",
+        "content": "Try different search terms",
         "source": "",
         "source_domain": "",
         "entities": [],
         "summary": "",
         "keywords": [],
-        "embedding": torch.zeros(384).to(DEVICE)
+        "embedding": torch.zeros(384).to(DEVICE),
+        "score": 0.0
     }
+    
+def get_domain(url: str) -> str:
+    """Extract domain from URL"""
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(url)
+        if not parsed.netloc:
+            return ""
+        return parsed.netloc.replace("www.", "").split(":")[0]
+    except:
+        return ""
 async def expand_query(query: str, user_id: Optional[str] = None) -> str:
     """Enhance search queries with spelling correction and expansion"""
     # Spelling correction
