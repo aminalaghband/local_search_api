@@ -240,29 +240,27 @@ def generate_documents(query: str) -> List[Dict[str, Any]]:
     )
 
     try:
-        # Fetch search results
         resp = client.post(search_url, data={"q": query})
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
-        results = soup.find_all("div", class_="result", limit=20)  # Try more results
-
+        results = soup.find_all("div", class_="result", limit=20)
+        # Fallback: try alternative selectors if no results
+        if not results:
+            results = soup.find_all("div", class_="web-result")
         if not results:
             print("No search results found. HTML:", resp.text[:1000])
 
         for res in results:
             try:
-                # Extract basic info
-                link_tag = res.find("a", class_="result__a")
+                link_tag = res.find("a", class_="result__a") or res.find("a", class_="web-result__title")
                 if not link_tag:
                     continue
-
                 link = link_tag.get("href", "")
                 title = link_tag.get_text(strip=True)
-                snippet = res.find("div", class_="result__snippet")
+                snippet = res.find("div", class_="result__snippet") or res.find("div", class_="web-result__snippet")
                 snippet = snippet.get_text(strip=True) if snippet else ""
                 print(f"Found result: {title} | {link}")
 
-                # Fetch and process full content
                 content = ""
                 try:
                     downloaded = fetch_url(link, timeout=5.0)
@@ -336,7 +334,6 @@ def is_named_entity(word: str) -> bool:
 
 async def expand_query(query: str, user_id: Optional[str] = None) -> str:
     """Smarter query expansion with limited, relevant synonyms."""
-    # Spelling correction
     try:
         corrected = str(TextBlob(query).correct())
         if fuzz.ratio(query, corrected) > 85:
@@ -346,16 +343,16 @@ async def expand_query(query: str, user_id: Optional[str] = None) -> str:
 
     expanded = set(query.split())
     for word in query.split():
-        # Only expand if not a named entity and is alphabetic
-        if not is_named_entity(word) and word.isalpha():
+        if not is_named_entity(word) and word.isalpha() and len(word) > 3:
             syns = wordnet.synsets(word)
             lemmas = set()
             for syn in syns:
                 for lemma in syn.lemmas():
                     if lemma.name().lower() != word.lower():
                         lemmas.add(lemma.name().replace("_", " "))
-            # Add up to 2 synonyms per word
-            expanded.update(list(lemmas)[:2])
+            # Only add the most frequent synonym
+            if lemmas:
+                expanded.add(list(lemmas)[0])
 
     # Add user preferences if available
     if user_id:
@@ -366,7 +363,7 @@ async def expand_query(query: str, user_id: Optional[str] = None) -> str:
             expanded.update(prefs["preferences"].get("preferred_topics", []))
 
     # Limit to 10 terms max
-    return " ".join(list(expanded)[:10])
+    return " ".join(list(expanded)[:8])
 @app.post("/search")
 async def neural_search(
     request: SearchRequest, 
