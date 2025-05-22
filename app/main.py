@@ -261,7 +261,32 @@ def create_empty_result(query: str) -> Dict:
         "keywords": [],
         "embedding": torch.zeros(384).to(DEVICE)
     }
+async def expand_query(query: str, user_id: Optional[str] = None) -> str:
+    """Enhance search queries with spelling correction and expansion"""
+    # Spelling correction
+    try:
+        corrected = str(TextBlob(query).correct())
+        if fuzz.ratio(query, corrected) > 85:
+            query = corrected
+    except:
+        pass
 
+    # Query expansion using WordNet
+    expanded = set(query.split())
+    for word in query.split():
+        for syn in wordnet.synsets(word):
+            for lemma in syn.lemmas():
+                expanded.add(lemma.name().replace("_", " "))
+    
+    # Add user preferences if available
+    if user_id:
+        prefs = await database.fetch_one(
+            user_prefs.select().where(user_prefs.c.user_id == user_id)
+        )
+        if prefs and prefs["preferences"]:
+            expanded.update(prefs["preferences"].get("preferred_topics", []))
+
+    return " ".join(list(expanded)[:10])  # Return top 10 terms
 @app.post("/search")
 async def neural_search(
     request: SearchRequest, 
