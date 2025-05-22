@@ -244,7 +244,10 @@ def generate_documents(query: str) -> List[Dict[str, Any]]:
         resp = client.post(search_url, data={"q": query})
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
-        results = soup.find_all("div", class_="result", limit=10)
+        results = soup.find_all("div", class_="result", limit=20)  # Try more results
+
+        if not results:
+            print("No search results found. HTML:", resp.text[:1000])
 
         for res in results:
             try:
@@ -252,11 +255,12 @@ def generate_documents(query: str) -> List[Dict[str, Any]]:
                 link_tag = res.find("a", class_="result__a")
                 if not link_tag:
                     continue
-                
+
                 link = link_tag.get("href", "")
                 title = link_tag.get_text(strip=True)
                 snippet = res.find("div", class_="result__snippet")
                 snippet = snippet.get_text(strip=True) if snippet else ""
+                print(f"Found result: {title} | {link}")
 
                 # Fetch and process full content
                 content = ""
@@ -273,17 +277,15 @@ def generate_documents(query: str) -> List[Dict[str, Any]]:
                     content = snippet
                     print(f"Content extraction failed for {link}: {str(e)}")
 
-                # Ensure minimum content requirements
                 if not content.strip():
                     content = snippet if snippet else "No content available"
 
-                # Process with GPU
                 features = gpu_extract_features(content)
-                
+
                 docs.append({
                     "id": abs(hash(link)) % (10**8),
-                    "title": title[:500],  # Limit title length
-                    "content": content[:10000],  # Limit content length
+                    "title": title[:500],
+                    "content": content[:10000],
                     "source": link,
                     "source_domain": get_domain(link),
                     **features
@@ -301,7 +303,6 @@ def generate_documents(query: str) -> List[Dict[str, Any]]:
     finally:
         client.close()
 
-    # Return empty result if no documents found
     return docs if docs else [create_empty_result(query)]
 
 def create_empty_result(query: str) -> Dict[str, Any]:
@@ -329,8 +330,12 @@ def get_domain(url: str) -> str:
         return parsed.netloc.replace("www.", "").split(":")[0]
     except:
         return ""
+def is_named_entity(word: str) -> bool:
+    doc = nlp(word)
+    return any(ent.label_ in ["GPE", "ORG", "PERSON", "LOC"] for ent in doc.ents)
+
 async def expand_query(query: str, user_id: Optional[str] = None) -> str:
-    """Enhance search queries with spelling correction and expansion"""
+    """Smarter query expansion with limited, relevant synonyms."""
     # Spelling correction
     try:
         corrected = str(TextBlob(query).correct())
@@ -339,13 +344,19 @@ async def expand_query(query: str, user_id: Optional[str] = None) -> str:
     except:
         pass
 
-    # Query expansion using WordNet
     expanded = set(query.split())
     for word in query.split():
-        for syn in wordnet.synsets(word):
-            for lemma in syn.lemmas():
-                expanded.add(lemma.name().replace("_", " "))
-    
+        # Only expand if not a named entity and is alphabetic
+        if not is_named_entity(word) and word.isalpha():
+            syns = wordnet.synsets(word)
+            lemmas = set()
+            for syn in syns:
+                for lemma in syn.lemmas():
+                    if lemma.name().lower() != word.lower():
+                        lemmas.add(lemma.name().replace("_", " "))
+            # Add up to 2 synonyms per word
+            expanded.update(list(lemmas)[:2])
+
     # Add user preferences if available
     if user_id:
         prefs = await database.fetch_one(
@@ -354,7 +365,8 @@ async def expand_query(query: str, user_id: Optional[str] = None) -> str:
         if prefs and prefs["preferences"]:
             expanded.update(prefs["preferences"].get("preferred_topics", []))
 
-    return " ".join(list(expanded)[:10])  # Return top 10 terms
+    # Limit to 10 terms max
+    return " ".join(list(expanded)[:10])
 @app.post("/search")
 async def neural_search(
     request: SearchRequest, 
