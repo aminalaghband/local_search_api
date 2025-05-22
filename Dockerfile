@@ -24,6 +24,6 @@ RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTr
 RUN python -m spacy download en_core_web_trf
 RUN python -m nltk.downloader punkt wordnet
 
-COPY main.py .
+COPY ./app /app
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
