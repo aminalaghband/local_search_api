@@ -24,6 +24,9 @@ from rank_bm25 import BM25Okapi
 import numpy as np
 from urllib.parse import urlparse
 from fastapi.middleware.cors import CORSMiddleware
+from typing import Tuple
+from typing import Any, Optional
+import spacy
 
 # Initialize CUDA
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -51,7 +54,13 @@ ner_pipeline = pipeline(
     device=0,
     aggregation_strategy="average"
 )
-
+try:
+    nlp = spacy.load("en_core_web_sm")
+except OSError:
+    # If the model isn't downloaded, download it first
+    from spacy.cli import download
+    download("en_core_web_sm")
+    nlp = spacy.load("en_core_web_sm")
 # Database setup
 database = databases.Database(DATABASE_URL)
 metadata = sqlalchemy.MetaData()
