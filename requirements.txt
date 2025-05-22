@@ -6,7 +6,7 @@ beautifulsoup4==4.12.0
 lxml==5.1.0
 trafilatura==1.6.2
 python-dotenv==1.0.0
-torch==2.3.0+cu121
+torch==2.3.0 --extra-index-url https://download.pytorch.org/whl/cu121
 sentence-transformers==2.2.2
 transformers==4.40.0
 accelerate==0.30.0
