@@ -2,7 +2,7 @@ FROM nvidia/cuda:12.1.1-base-ubuntu22.04
 
 WORKDIR /app
 
-# System dependencies
+# 1. First install system CUDA packages
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     python3.10 \
@@ -10,10 +10,13 @@ RUN apt-get update && \
     python3-dev \
     git \
     libgl1 \
-    libglib2.0-0 && \
+    libglib2.0-0 \
+    cuda-toolkit-12-1 \
+    libcudnn8=8.9.2.26-1+cuda12.1 && \  # Matches PyTorch's requirement
+RUN apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
+# 2. Then install Python packages
 COPY requirements.txt .
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121 && \
