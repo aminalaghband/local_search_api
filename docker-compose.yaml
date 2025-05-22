@@ -1,0 +1,39 @@
+version: "3.3"
+
+services:
+  meilisearch:
+    image: getmeili/meilisearch:v1.7
+    container_name: meilisearch
+    ports:
+      - "7700:7700"
+    environment:
+      MEILI_MASTER_KEY: "masterKeyKeyKey123"
+      MEILI_ENV: "development"  # Critical for v1.7+
+    volumes:
+      - meili_data:/meili_data
+    networks:
+      - search_network
+
+  api:
+    build:
+      context: ./app
+    container_name: local_search_api
+    ports:
+      - "8880:8000"
+    environment:
+      DATABASE_URL: "sqlite:////app/data/local_search.db"
+      MEILI_HOST: "http://meilisearch:7700"
+      MEILI_MASTER_KEY: "masterKeyKeyKey123"
+    depends_on:
+      - meilisearch
+    volumes:
+      - ./data:/app/data
+    networks:
+      - search_network
+
+volumes:
+  meili_data:
+
+networks:
+  search_network:
+    driver: bridge
