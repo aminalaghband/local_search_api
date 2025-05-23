@@ -384,7 +384,7 @@ async def neural_search(
     x_api_key: str = Header(...)
 ):
     """Main search endpoint with GPU acceleration"""
-    if not verify_api_key(x_api_key):
+    if not await verify_api_key(x_api_key):
         raise HTTPException(status_code=401, detail="Invalid API key")
     
     # Start GPU timer
@@ -403,7 +403,7 @@ async def neural_search(
     # End GPU timer
     end_event.record()
     torch.cuda.synchronize()
-    gpu_time = start_event.elapsed_time(end_event)
+    gpu_time = float(start_event.elapsed_time(end_event))  # Ensure this is a Python float
     
     # Build response
     return SearchResponse(
@@ -415,7 +415,7 @@ async def neural_search(
                 source=doc["source"],
                 summary=doc["summary"],
                 entities=doc["entities"],
-                score=float(score.item()) if hasattr(score, "item") else float(score),
+                score=float(score),  # Convert numpy/tensor to Python float
                 processing_time_ms=gpu_time
             )
             for doc, score in zip(ranked_docs[:request.limit], scores)
@@ -427,7 +427,7 @@ async def neural_search(
         },
         hardware={
             "device": torch.cuda.get_device_name(0),
-            "memory_used": torch.cuda.memory_allocated(0),
+            "memory_used": int(torch.cuda.memory_allocated(0)),
             "compute_time_ms": gpu_time
         }
     )
