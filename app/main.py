@@ -404,8 +404,14 @@ async def neural_search(
     end_event.record()
     torch.cuda.synchronize()
     gpu_time = float(start_event.elapsed_time(end_event))  # Ensure this is a Python float
-    
-    # Build response
+
+    # --- FIX: Convert all scores to Python float ---
+    def to_pyfloat(val):
+        # Handles numpy.float16, numpy.float32, numpy.float64, torch tensors, etc.
+        if hasattr(val, "item"):
+            return float(val.item())
+        return float(val)
+
     return SearchResponse(
         results=[
             EnhancedResult(
@@ -415,8 +421,8 @@ async def neural_search(
                 source=doc["source"],
                 summary=doc["summary"],
                 entities=doc["entities"],
-                score=float(score),  # Convert numpy/tensor to Python float
-                processing_time_ms=gpu_time
+                score=to_pyfloat(score),
+                processing_time_ms=to_pyfloat(gpu_time)
             )
             for doc, score in zip(ranked_docs[:request.limit], scores)
         ],
@@ -428,7 +434,7 @@ async def neural_search(
         hardware={
             "device": torch.cuda.get_device_name(0),
             "memory_used": int(torch.cuda.memory_allocated(0)),
-            "compute_time_ms": gpu_time
+            "compute_time_ms": to_pyfloat(gpu_time)
         }
     )
 
