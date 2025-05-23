@@ -29,10 +29,13 @@ from typing import Any, Optional
 import spacy
 import re
 import wikipedia
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+import gc
+import asyncio
 
 # Initialize CUDA
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"🚀 Initializing with {torch.cuda.get_device_name(0)}")
+print(f"Initializing with {torch.cuda.get_device_name(0)}")
 
 # Configuration
 DATABASE_URL = "sqlite:////app/data/local_search.db"
@@ -41,6 +44,7 @@ MEILI_MASTER_KEY = os.getenv("MEILI_MASTER_KEY", "")
 INDEX_NAME = "documents"
 MIN_RESULTS_FOR_REFETCH = 3
 MAX_DOCS_TO_INDEX = 50
+SEARCH_TIMEOUT = float(os.getenv("SEARCH_TIMEOUT", "10.0"))  # Seconds
 
 # Initialize models with mixed precision
 semantic_model = SentenceTransformer('all-MiniLM-L6-v2').to(DEVICE)
@@ -150,12 +154,19 @@ async def startup():
     await initialize_meilisearch_index()
     nltk.download('punkt', quiet=True)
     nltk.download('wordnet', quiet=True)
-    print("✅ Services initialized")
+    print("Services initialized")
 
 @app.on_event("shutdown")
 async def shutdown():
+    """Cleanup resources on shutdown"""
     await database.disconnect()
-    torch.cuda.empty_cache()
+    
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
+        print(f"Freed {torch.cuda.memory_allocated()//1024**2}MB GPU memory")
+    
+    print("Service shutdown complete")
 
 async def initialize_meilisearch_index():
     async with httpx.AsyncClient() as client:
@@ -183,7 +194,7 @@ async def verify_api_key(key: str):
     return result is not None
 
 def gpu_extract_features(text: str) -> Dict:
-    """Extract NLP features with type-safe conversions"""
+    """Extract NLP features with proper CUDA tensor handling"""
     features = {
         "entities": [],
         "summary": "",
@@ -193,25 +204,25 @@ def gpu_extract_features(text: str) -> Dict:
     
     try:
         with torch.no_grad(), torch.cuda.amp.autocast():
-            # Entity recognition with conversion
+            # Entity recognition
             entities = ner_pipeline(text[:512])
-            if entities:
-                features["entities"] = [convert_numpy_types(e) for e in entities]
+            features["entities"] = [convert_numpy_types(e) for e in entities]
             
             # Summarization
             summary = summarizer(text[:1024], max_length=130)[0]["summary_text"]
-            features["summary"] = str(summary) if summary else ""
+            features["summary"] = str(summary)
             
-            # Semantic embedding as list
-            embedding = semantic_model.encode(text, convert_to_tensor=True)
-            features["embedding"] = convert_numpy_types(embedding)
+            # Semantic embedding (convert to CPU numpy array)
+            embedding = semantic_model.encode(text[:512], convert_to_tensor=True)
+            features["embedding"] = embedding.cpu().numpy().tolist()
             
-            # Keywords via noun chunks
+            # Keywords
             doc = nlp(text[:10000])
             features["keywords"] = list(set([str(chunk.text) for chunk in doc.noun_chunks]))
             
     except Exception as e:
         print(f"Feature extraction error: {str(e)}")
+        features["embedding"] = []
     
     return features
 
@@ -352,7 +363,7 @@ def generate_documents(query: str) -> List[Dict[str, Any]]:
     return docs if docs else [create_empty_result(query)]
 
 async def hybrid_search(query: str, documents: List[Dict]) -> Tuple[List[Dict], List[float]]:
-    """Hybrid scoring with type-safe conversions"""
+    """Hybrid search with CUDA safety and timeout handling"""
     if not documents:
         return [], []
     
@@ -360,30 +371,83 @@ async def hybrid_search(query: str, documents: List[Dict]) -> Tuple[List[Dict], 
     if not valid_docs:
         return [], []
     
-    # Convert embeddings to numpy arrays
-    embeddings = [np.array(doc["embedding"], dtype=np.float32) for doc in valid_docs]
-    
-    # BM25 lexical
-    tokenized_docs = [doc["content"].split() for doc in valid_docs]
-    bm25 = BM25Okapi(tokenized_docs)
-    lexical_scores = np.array(bm25.get_scores(query.split()), dtype=np.float32)
-    
-    # Semantic
-    query_embed = semantic_model.encode(query, convert_to_tensor=False)
-    semantic_scores = cosine_similarity([query_embed], embeddings)[0].astype(np.float32)
-    
-    # Phrase and domain bonuses
-    phrase_bonus = np.array([2.0 if query.lower() in doc["content"].lower() else 1.0 
-                           for doc in valid_docs], dtype=np.float32)
-    domain_bonus = np.array([1.5 if doc.get("source_domain") == "wikipedia.org" else 1.0 
-                           for doc in valid_docs], dtype=np.float32)
-    
-    # Combine scores with type conversion
-    combined = (0.5 * semantic_scores + 0.5 * lexical_scores) * phrase_bonus * domain_bonus
-    combined = combined.tolist()  # Convert to native list
-    
-    ranked_indices = np.argsort(combined)[::-1]
-    return [valid_docs[i] for i in ranked_indices], [combined[i] for i in ranked_indices]
+    # Pre-process query embedding in main thread with CUDA
+    try:
+        # Get query embedding before moving to thread
+        with torch.no_grad():
+            query_embed = semantic_model.encode(query, convert_to_tensor=True).cpu().numpy()
+    except Exception as e:
+        print(f"Query embedding failed: {str(e)}")
+        return [], []
+
+    # Define CPU-only search logic
+    def _cpu_search_core(query_embed: np.ndarray, valid_docs: List[Dict]):
+        try:
+            # Validate and convert document embeddings
+            embeddings = []
+            for doc in valid_docs:
+                if isinstance(doc["embedding"], list):
+                    emb = np.array(doc["embedding"], dtype=np.float32)
+                elif torch.is_tensor(doc["embedding"]):
+                    emb = doc["embedding"].cpu().numpy()
+                else:
+                    raise ValueError("Invalid embedding format")
+                embeddings.append(emb)
+
+            # BM25 lexical
+            tokenized_docs = [doc["content"].split() for doc in valid_docs]
+            bm25 = BM25Okapi(tokenized_docs)
+            lexical_scores = np.array(bm25.get_scores(query.split()), dtype=np.float32)
+
+            # Semantic similarity
+            semantic_scores = cosine_similarity([query_embed], embeddings)[0].astype(np.float32)
+
+            # Combine scores
+            phrase_bonus = np.array([2.0 if query.lower() in doc["content"].lower() else 1.0 
+                                   for doc in valid_docs], dtype=np.float32)
+            domain_bonus = np.array([1.5 if doc.get("source_domain") == "wikipedia.org" else 1.0 
+                                   for doc in valid_docs], dtype=np.float32)
+
+            combined = (0.5 * semantic_scores + 0.5 * lexical_scores) * phrase_bonus * domain_bonus
+            return combined.tolist()
+        
+        except Exception as e:
+            print(f"Search core error: {str(e)}")
+            return None
+
+    try:
+        # Run CPU-intensive parts in thread pool
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            # Pass pre-computed query embedding
+            future = loop.run_in_executor(
+                executor,
+                _cpu_search_core,
+                query_embed,
+                valid_docs
+            )
+            combined = await asyncio.wait_for(future, timeout=10.0)
+
+            if combined is None:
+                return [], []
+
+            ranked_indices = np.argsort(combined)[::-1]
+            return (
+                [valid_docs[i] for i in ranked_indices],
+                [combined[i] for i in ranked_indices]
+            )
+            
+    except TimeoutError:
+        print("🕒 Search timed out after 10 seconds")
+        return [], []
+    except Exception as e:
+        print(f"Hybrid search failed: {str(e)}")
+        return [], []
+    finally:
+        # Cleanup resources
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
 
 
 def create_empty_result(query: str) -> Dict[str, Any]:

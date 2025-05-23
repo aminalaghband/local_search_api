@@ -1,7 +1,8 @@
 FROM nvidia/cuda:12.1.1-base-ubuntu22.04
 
 WORKDIR /app
-
+ENV PYTHONUNBUFFERED=1
+ENV CUDA_MEM_LIMIT=4096
 # 1. Install system dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
