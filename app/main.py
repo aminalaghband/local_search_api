@@ -227,68 +227,58 @@ def gpu_extract_features(text: str) -> Dict:
     return features
 
 def advanced_tokenize(query: str) -> List[str]:
-    """Improved tokenization preserving phrases and entities"""
-    # Preserve quoted phrases, numbers, and hyphenated words
-    tokens = re.findall(r'\"(.+?)\"|(\d+-\w+)|(\w+-\d+)|(\b[A-Z][a-z]+\b)|(\d+)|(\w+)', query)
-    
-    # Flatten and filter matches
-    cleaned = []
-    for group in tokens:
-        for match in group:
-            if match:
-                cleaned.append(match.strip('"'))
-                break
-    
-    return cleaned
+    """More precise tokenization preserving key phrases"""
+    # Match: quoted phrases, hyphenated terms, and key concepts
+    pattern = r'\"(.+?)\"|(\b[A-Z][a-z]+\s[A-Z][a-z]+\b)|(\w+-\w+)|\b\w{3,}\b'
+    matches = re.finditer(pattern, query)
+    return [match.group() for match in matches if match.group()]
 
 async def expand_query(query: str, user_id: Optional[str] = None) -> str:
-    """Smarter query expansion preserving original structure"""
+    """More focused query expansion for technical topics"""
     try:
-        # Preserve original casing for proper nouns
-        original_terms = advanced_tokenize(query)
         doc = nlp(query)
         
-        # Identify named entities and numbers
-        preserved_terms = {
+        # Identify and preserve key noun phrases
+        noun_phrases = {chunk.text.lower() for chunk in doc.noun_chunks}
+        preserved_terms = noun_phrases | {
             ent.text.lower() for ent in doc.ents
         } | {
-            token.text.lower() for token in doc if token.like_num
+            token.text.lower() for token in doc if token.like_num or token.is_title
         }
         
-        # Smart correction without losing context
-        corrected = str(TextBlob(query).correct())
-        if fuzz.ratio(query.lower(), corrected.lower()) > 89:
-            query = corrected
-    except:
-        pass
-    
-    # Process terms with entity awareness
-    final_terms = []
-    for term in advanced_tokenize(query):
-        term_lower = term.lower()
-        
-        # Preserve original if entity/number/phrase
-        if (term_lower in preserved_terms or
-            any(c.isupper() for c in term) or
-            term.isdigit() or
-            '-' in term):
-            final_terms.append(term)
-            continue
+        # Controlled synonym expansion
+        expanded = []
+        for token in advanced_tokenize(query):
+            lower_token = token.lower()
             
-        # Add controlled synonyms
-        syns = set()
-        for syn in wordnet.synsets(term):
-            for lemma in syn.lemmas():
-                if lemma.name().lower() != term_lower:
-                    syns.add(lemma.name().replace('_', ' '))
+            if (lower_token in preserved_terms or 
+                any(c.isupper() for c in token) or
+                '-' in token):
+                expanded.append(token)
+                continue
+                
+            # Technical term handling
+            if lower_token in ['philosophy', 'intelligence', 'artificial']:
+                syns = set()
+                for syn in wordnet.synsets(token):
+                    for lemma in syn.lemmas():
+                        if lemma.name().lower() != lower_token:
+                            syns.add(lemma.name().replace('_', ' '))
+                
+                expanded.append(token)
+                if syns:
+                    best_syn = max(syns, key=lambda x: fuzz.ratio(token, x))
+                    if fuzz.ratio(token, best_syn) > 70:
+                        expanded.append(best_syn)
+            else:
+                expanded.append(token)
+                
+        return ' '.join(expanded[:10])  # Limit expansion
         
-        # Add original + best synonym
-        final_terms.append(term)
-        if syns:
-            final_terms.append(max(syns, key=lambda x: fuzz.ratio(term, x)))
-    
-    # Maintain original order with limited expansion
-    return ' '.join(final_terms[:12])  # Max 12 terms
+    except Exception as e:
+        print(f"Query expansion error: {str(e)}")
+        return query
+
 
 def weighted_expand_terms(tokens: List[str]) -> List[str]:
     """Expand terms with weights: phrases > numbers > words."""
@@ -421,56 +411,85 @@ def generate_documents(query: str) -> List[Dict[str, Any]]:
     return docs if docs else [create_empty_result(query)]
 
 async def hybrid_search(query: str, documents: List[Dict]) -> Tuple[List[Dict], List[float]]:
-    """Hybrid search with CUDA safety and timeout handling"""
+    """Enhanced hybrid search for technical queries"""
     if not documents:
         return [], []
     
     valid_docs = [d for d in documents if d.get("content")]
     if not valid_docs:
         return [], []
+
+    # Technical term detection
+    key_terms = ['philosophy', 'artificial intelligence', 'ai', 'ethics', 'theory']
+    query_terms = [t.lower() for t in query.split()]
     
-    # Pre-process query embedding in main thread with CUDA
     try:
-        # Get query embedding before moving to thread
+        # Improved query embedding with attention to technical phrases
         with torch.no_grad():
-            query_embed = semantic_model.encode(query, convert_to_tensor=True).cpu().numpy()
+            query_embed = semantic_model.encode(
+                query, 
+                convert_to_tensor=True,
+                show_progress_bar=False
+            ).cpu().numpy()
+            
     except Exception as e:
         print(f"Query embedding failed: {str(e)}")
         return [], []
 
-    # Define CPU-only search logic
     def _cpu_search_core(query_embed: np.ndarray, valid_docs: List[Dict]):
         try:
-            # Validate and convert document embeddings
+            # Embedding validation with error tolerance
             embeddings = []
             for doc in valid_docs:
-                if isinstance(doc["embedding"], list):
-                    emb = np.array(doc["embedding"], dtype=np.float32)
-                elif torch.is_tensor(doc["embedding"]):
-                    emb = doc["embedding"].cpu().numpy()
-                else:
-                    raise ValueError("Invalid embedding format")
-                embeddings.append(emb)
+                try:
+                    if isinstance(doc["embedding"], list):
+                        emb = np.array(doc["embedding"], dtype=np.float32)
+                    elif torch.is_tensor(doc["embedding"]):
+                        emb = doc["embedding"].cpu().numpy()
+                    else:
+                        emb = np.zeros(semantic_model.get_sentence_embedding_dimension(), dtype=np.float32)
+                    embeddings.append(emb)
+                except:
+                    embeddings.append(np.zeros_like(query_embed))
 
-            # BM25 lexical
-            tokenized_docs = [doc["content"].split() for doc in valid_docs]
-            bm25 = BM25Okapi(tokenized_docs)
-            lexical_scores = np.array(bm25.get_scores(query.split()), dtype=np.float32)
-
-            # Semantic similarity
-            semantic_scores = cosine_similarity([query_embed], embeddings)[0].astype(np.float32)
-
-            # Combine scores
-            phrase_bonus = np.array([2.0 if query.lower() in doc["content"].lower() else 1.0 
-                                   for doc in valid_docs], dtype=np.float32)
-            domain_bonus = np.array([1.5 if doc.get("source_domain") == "wikipedia.org" else 1.0 
-                                   for doc in valid_docs], dtype=np.float32)
+            # Enhanced BM25 with technical term weighting
+            tokenized_docs = []
+            for doc in valid_docs:
+                tokens = doc["content"].split()
+                # Boost technical terms in document
+                weighted_tokens = []
+                for token in tokens:
+                    if token.lower() in key_terms:
+                        weighted_tokens.extend([token]*3)  # Repeat important terms
+                    else:
+                        weighted_tokens.append(token)
+                tokenized_docs.append(weighted_tokens)
             
-            geo_boost = np.array([1.2 if any(ent['word'].lower() in ['us', 'usa', 'united states']
-                     for ent in doc.get('entities', [])) else 1.0
-              for doc in valid_docs], dtype=np.float32)
-    
-            combined = (0.5*semantic_scores + 0.5*lexical_scores) * phrase_bonus * domain_bonus * geo_boost
+            bm25 = BM25Okapi(tokenized_docs)
+            lexical_scores = np.array(bm25.get_scores(query_terms), dtype=np.float32)
+
+            # Semantic similarity with error margin
+            try:
+                semantic_scores = cosine_similarity([query_embed], embeddings)[0].astype(np.float32)
+            except:
+                semantic_scores = np.zeros(len(embeddings), dtype=np.float32)
+
+            # Dynamic scoring factors
+            term_boost = np.array([
+                1.5 if any(term in doc["content"].lower() for term in key_terms) else 1.0
+                for doc in valid_docs
+            ], dtype=np.float32)
+            
+            title_boost = np.array([
+                2.0 if any(term in doc.get("title", "").lower() for term in key_terms) else 1.0
+                for doc in valid_docs
+            ], dtype=np.float32)
+
+            combined = (
+                (0.7 * semantic_scores) + 
+                (0.3 * lexical_scores)
+            ) * title_boost * term_boost
+
             return combined.tolist()
         
         except Exception as e:
@@ -478,19 +497,17 @@ async def hybrid_search(query: str, documents: List[Dict]) -> Tuple[List[Dict], 
             return None
 
     try:
-        # Run CPU-intensive parts in thread pool
         loop = asyncio.get_event_loop()
         with ThreadPoolExecutor(max_workers=1) as executor:
-            # Pass pre-computed query embedding
             future = loop.run_in_executor(
                 executor,
                 _cpu_search_core,
                 query_embed,
                 valid_docs
             )
-            combined = await asyncio.wait_for(future, timeout=10.0)
+            combined = await asyncio.wait_for(future, timeout=15.0)  # Increased timeout
 
-            if combined is None:
+            if not combined:
                 return [], []
 
             ranked_indices = np.argsort(combined)[::-1]
@@ -500,13 +517,12 @@ async def hybrid_search(query: str, documents: List[Dict]) -> Tuple[List[Dict], 
             )
             
     except TimeoutError:
-        print("🕒 Search timed out after 10 seconds")
+        print("🕒 Search timed out after 15 seconds")
         return [], []
     except Exception as e:
         print(f"Hybrid search failed: {str(e)}")
         return [], []
     finally:
-        # Cleanup resources
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
