@@ -166,9 +166,10 @@ async def initialize_meilisearch_index():
         except httpx.HTTPStatusError as e:
             print(f"⚠️ MeiliSearch initialization error: {e}")
 
-def verify_api_key(key: str):
+async def verify_api_key(key: str):
     query = api_keys.select().where(api_keys.c.key == key)
-    return database.fetch_one(query) is not None
+    result = await database.fetch_one(query)
+    return result is not None
 
 def gpu_extract_features(text: str) -> Dict:
     """Extract NLP features using GPU acceleration"""
