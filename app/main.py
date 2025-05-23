@@ -408,17 +408,20 @@ async def neural_search(
 
     # Robust conversion for all numpy/tensor types
     def to_pyfloat(val):
+        """Convert any numeric type to Python float with robust error handling"""
+        if val is None:
+            return 0.0
         try:
-            if hasattr(val, "item"):
+            if hasattr(val, "item"):  # Handles torch.Tensor and numpy.generic
                 return float(val.item())
-            if isinstance(val, (np.floating, np.integer)):
+            if isinstance(val, (np.floating, np.integer, np.ndarray)):
                 return float(val)
             return float(val)
-        except Exception:
+        except (TypeError, ValueError):
             return 0.0
 
     py_scores = [to_pyfloat(s) for s in scores]
-
+    
     return SearchResponse(
         results=[
             EnhancedResult(
