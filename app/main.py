@@ -227,10 +227,68 @@ def gpu_extract_features(text: str) -> Dict:
     return features
 
 def advanced_tokenize(query: str) -> List[str]:
-    """Tokenize query preserving quoted phrases and numbers."""
-    # Preserve phrases in quotes and numbers as single tokens
-    tokens = re.findall(r'"[^"]+"|\d+|\w+', query)
-    return [t.strip('"') for t in tokens]
+    """Improved tokenization preserving phrases and entities"""
+    # Preserve quoted phrases, numbers, and hyphenated words
+    tokens = re.findall(r'\"(.+?)\"|(\d+-\w+)|(\w+-\d+)|(\b[A-Z][a-z]+\b)|(\d+)|(\w+)', query)
+    
+    # Flatten and filter matches
+    cleaned = []
+    for group in tokens:
+        for match in group:
+            if match:
+                cleaned.append(match.strip('"'))
+                break
+    
+    return cleaned
+
+async def expand_query(query: str, user_id: Optional[str] = None) -> str:
+    """Smarter query expansion preserving original structure"""
+    try:
+        # Preserve original casing for proper nouns
+        original_terms = advanced_tokenize(query)
+        doc = nlp(query)
+        
+        # Identify named entities and numbers
+        preserved_terms = {
+            ent.text.lower() for ent in doc.ents
+        } | {
+            token.text.lower() for token in doc if token.like_num
+        }
+        
+        # Smart correction without losing context
+        corrected = str(TextBlob(query).correct())
+        if fuzz.ratio(query.lower(), corrected.lower()) > 89:
+            query = corrected
+    except:
+        pass
+    
+    # Process terms with entity awareness
+    final_terms = []
+    for term in advanced_tokenize(query):
+        term_lower = term.lower()
+        
+        # Preserve original if entity/number/phrase
+        if (term_lower in preserved_terms or
+            any(c.isupper() for c in term) or
+            term.isdigit() or
+            '-' in term):
+            final_terms.append(term)
+            continue
+            
+        # Add controlled synonyms
+        syns = set()
+        for syn in wordnet.synsets(term):
+            for lemma in syn.lemmas():
+                if lemma.name().lower() != term_lower:
+                    syns.add(lemma.name().replace('_', ' '))
+        
+        # Add original + best synonym
+        final_terms.append(term)
+        if syns:
+            final_terms.append(max(syns, key=lambda x: fuzz.ratio(term, x)))
+    
+    # Maintain original order with limited expansion
+    return ' '.join(final_terms[:12])  # Max 12 terms
 
 def weighted_expand_terms(tokens: List[str]) -> List[str]:
     """Expand terms with weights: phrases > numbers > words."""
@@ -407,8 +465,12 @@ async def hybrid_search(query: str, documents: List[Dict]) -> Tuple[List[Dict], 
                                    for doc in valid_docs], dtype=np.float32)
             domain_bonus = np.array([1.5 if doc.get("source_domain") == "wikipedia.org" else 1.0 
                                    for doc in valid_docs], dtype=np.float32)
-
-            combined = (0.5 * semantic_scores + 0.5 * lexical_scores) * phrase_bonus * domain_bonus
+            
+            geo_boost = np.array([1.2 if any(ent['word'].lower() in ['us', 'usa', 'united states']
+                     for ent in doc.get('entities', [])) else 1.0
+              for doc in valid_docs], dtype=np.float32)
+    
+            combined = (0.5*semantic_scores + 0.5*lexical_scores) * phrase_bonus * domain_bonus * geo_boost
             return combined.tolist()
         
         except Exception as e:
@@ -451,17 +513,21 @@ async def hybrid_search(query: str, documents: List[Dict]) -> Tuple[List[Dict], 
 
 
 def create_empty_result(query: str) -> Dict[str, Any]:
-    """Better empty result handling."""
     return {
         "id": abs(hash(query)) % (10**8),
-        "title": f"No results for '{query}'",
-        "content": "Try different search terms or check your spelling.",
+        "title": f"No results for '{query[:50]}'",
+        "content": "Try: " + ", ".join([
+            "Using more specific terms",
+            "Checking spelling",
+            "Adding location names",
+            "Using fewer synonyms"
+        ]),
         "source": "",
         "source_domain": "",
         "entities": [],
         "summary": "",
         "keywords": [],
-        "embedding": torch.zeros(384).to(DEVICE),
+        "embedding": [],
         "score": 0.0
     }
     
