@@ -27,6 +27,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import Tuple
 from typing import Any, Optional
 import spacy
+import re
+import wikipedia
 
 # Initialize CUDA
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -191,65 +193,72 @@ def gpu_extract_features(text: str) -> Dict:
         "keywords": keywords
     }
 
-async def hybrid_search(query: str, documents: List[Dict]) -> Tuple[List[Dict], List[float]]:
-    """Safe implementation of hybrid search with empty document handling"""
-    if not documents:
-        return [], []
-    
-    # Filter out empty documents
-    valid_docs = [d for d in documents if d.get("content")]
-    if not valid_docs:
-        return [], []
-    
-    # Tokenize documents
-    tokenized_docs = [doc["content"].split() for doc in valid_docs]
-    tokenized_docs = [doc for doc in tokenized_docs if doc]  # Remove empty token lists
-    
-    # If no valid tokens, return empty results
-    if not tokenized_docs:
-        return [], []
-    
-    # Proceed with BM25 and semantic search
-    try:
-        bm25 = BM25Okapi(tokenized_docs)
-        lexical_scores = bm25.get_scores(query.split())
-        
-        query_embed = semantic_model.encode(query, convert_to_tensor=True)
-        doc_embeds = torch.stack([doc["embedding"] for doc in valid_docs])
-        semantic_scores = torch.nn.functional.cosine_similarity(
-            query_embed, 
-            doc_embeds
-        ).cpu().numpy()
-        
-        combined = 0.6*semantic_scores + 0.4*lexical_scores
-        ranked_indices = np.argsort(combined)[::-1]
-        
-        return [valid_docs[i] for i in ranked_indices], combined[ranked_indices]
-    except Exception as e:
-        print(f"Search error: {str(e)}")
-        return [], []
+def advanced_tokenize(query: str) -> List[str]:
+    """Tokenize query preserving quoted phrases and numbers."""
+    # Preserve phrases in quotes and numbers as single tokens
+    tokens = re.findall(r'"[^"]+"|\d+|\w+', query)
+    return [t.strip('"') for t in tokens]
 
-def generate_documents(query: str) -> List[Dict[str, Any]]:
-    """Generate search documents with robust error handling and content validation"""
-    search_url = "https://html.duckduckgo.com/html/"
+def weighted_expand_terms(tokens: List[str]) -> List[str]:
+    """Expand terms with weights: phrases > numbers > words."""
+    expanded = []
+    for token in tokens:
+        if token.isdigit():
+            expanded.append(token)
+            continue
+        if len(token.split()) > 1:  # phrase
+            expanded.append(token)
+            continue
+        if is_named_entity(token) or len(token) < 4:
+            expanded.append(token)
+            continue
+        syns = wordnet.synsets(token)
+        lemmas = set()
+        for syn in syns:
+            for lemma in syn.lemmas():
+                if lemma.name().lower() != token.lower():
+                    lemmas.add(lemma.name().replace("_", " "))
+        # Add original and up to 1 synonym
+        expanded.append(token)
+        if lemmas:
+            expanded.append(list(lemmas)[0])
+    return expanded[:10]
+
+async def expand_query(query: str, user_id: Optional[str] = None) -> str:
+    """Advanced query expansion with phrase and number handling."""
+    try:
+        corrected = str(TextBlob(query).correct())
+        if fuzz.ratio(query, corrected) > 85:
+            query = corrected
+    except:
+        pass
+    tokens = advanced_tokenize(query)
+    expanded = set(weighted_expand_terms(tokens))
+    # Add user preferences if available
+    if user_id:
+        prefs = await database.fetch_one(
+            user_prefs.select().where(user_prefs.c.user_id == user_id)
+        )
+        if prefs and prefs["preferences"]:
+            expanded.update(prefs["preferences"].get("preferred_topics", []))
+    return " ".join(list(expanded)[:10])
+
+def generate_duckduckgo_documents(query: str) -> List[Dict[str, Any]]:
+    """DuckDuckGo scraping with error handling."""
     docs = []
+    search_url = "https://html.duckduckgo.com/html/"
     client = httpx.Client(
         headers={"User-Agent": "Mozilla/5.0"},
         timeout=30.0,
         follow_redirects=True
     )
-
     try:
         resp = client.post(search_url, data={"q": query})
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
-        results = soup.find_all("div", class_="result", limit=20)
-        # Fallback: try alternative selectors if no results
+        results = soup.find_all("div", class_="result", limit=10)
         if not results:
             results = soup.find_all("div", class_="web-result")
-        if not results:
-            print("No search results found. HTML:", resp.text[:1000])
-
         for res in results:
             try:
                 link_tag = res.find("a", class_="result__a") or res.find("a", class_="web-result__title")
@@ -259,27 +268,14 @@ def generate_documents(query: str) -> List[Dict[str, Any]]:
                 title = link_tag.get_text(strip=True)
                 snippet = res.find("div", class_="result__snippet") or res.find("div", class_="web-result__snippet")
                 snippet = snippet.get_text(strip=True) if snippet else ""
-                print(f"Found result: {title} | {link}")
-
-                content = ""
+                content = snippet
                 try:
                     downloaded = fetch_url(link, timeout=5.0)
                     if downloaded:
-                        content = extract(
-                            downloaded,
-                            include_formatting=False,
-                            include_links=False,
-                            include_tables=False
-                        ) or snippet
-                except Exception as e:
-                    content = snippet
-                    print(f"Content extraction failed for {link}: {str(e)}")
-
-                if not content.strip():
-                    content = snippet if snippet else "No content available"
-
+                        content = extract(downloaded) or snippet
+                except Exception:
+                    pass
                 features = gpu_extract_features(content)
-
                 docs.append({
                     "id": abs(hash(link)) % (10**8),
                     "title": title[:500],
@@ -288,27 +284,77 @@ def generate_documents(query: str) -> List[Dict[str, Any]]:
                     "source_domain": get_domain(link),
                     **features
                 })
-
-                if len(docs) >= MAX_DOCS_TO_INDEX:
-                    break
-
             except Exception as e:
-                print(f"Error processing result: {str(e)}")
+                print(f"DuckDuckGo result error: {e}")
                 continue
-
     except Exception as e:
-        print(f"Search failed: {str(e)}")
+        print(f"DuckDuckGo search failed: {e}")
     finally:
         client.close()
+    return docs
 
+def generate_wikipedia_documents(query: str) -> List[Dict[str, Any]]:
+    """Wikipedia fallback source."""
+    docs = []
+    try:
+        search_results = wikipedia.search(query, results=2)
+        for title in search_results:
+            try:
+                page = wikipedia.page(title)
+                content = page.content[:10000]
+                features = gpu_extract_features(content)
+                docs.append({
+                    "id": abs(hash(page.url)) % (10**8),
+                    "title": page.title,
+                    "content": content,
+                    "source": page.url,
+                    "source_domain": "wikipedia.org",
+                    **features
+                })
+            except Exception as e:
+                print(f"Wikipedia fetch failed: {e}")
+    except Exception as e:
+        print(f"Wikipedia search failed: {e}")
+    return docs
+
+def generate_documents(query: str) -> List[Dict[str, Any]]:
+    """Aggregate from multiple sources with error handling."""
+    docs = []
+    docs += generate_duckduckgo_documents(query)
+    docs += generate_wikipedia_documents(query)
+    # Add more sources here as needed
     return docs if docs else [create_empty_result(query)]
 
+async def hybrid_search(query: str, documents: List[Dict]) -> Tuple[List[Dict], List[float]]:
+    """Hybrid scoring with phrase and domain weighting."""
+    if not documents:
+        return [], []
+    valid_docs = [d for d in documents if d.get("content")]
+    if not valid_docs:
+        return [], []
+    # Phrase bonus: boost docs containing exact query phrase
+    phrase_bonus = np.array([2.0 if query.lower() in doc["content"].lower() else 1.0 for doc in valid_docs])
+    # Domain weighting: boost Wikipedia
+    domain_bonus = np.array([1.5 if doc.get("source_domain") == "wikipedia.org" else 1.0 for doc in valid_docs])
+    # BM25 lexical
+    tokenized_docs = [doc["content"].split() for doc in valid_docs]
+    bm25 = BM25Okapi(tokenized_docs)
+    lexical_scores = np.array(bm25.get_scores(query.split()))
+    # Semantic
+    query_embed = semantic_model.encode(query, convert_to_tensor=True)
+    doc_embeds = torch.stack([doc["embedding"] for doc in valid_docs])
+    semantic_scores = torch.nn.functional.cosine_similarity(query_embed, doc_embeds).cpu().numpy()
+    # Combine
+    combined = (0.5 * semantic_scores + 0.5 * lexical_scores) * phrase_bonus * domain_bonus
+    ranked_indices = np.argsort(combined)[::-1]
+    return [valid_docs[i] for i in ranked_indices], combined[ranked_indices]
+
 def create_empty_result(query: str) -> Dict[str, Any]:
-    """Create a placeholder result for empty searches"""
+    """Better empty result handling."""
     return {
         "id": abs(hash(query)) % (10**8),
         "title": f"No results for '{query}'",
-        "content": "Try different search terms",
+        "content": "Try different search terms or check your spelling.",
         "source": "",
         "source_domain": "",
         "entities": [],
@@ -332,38 +378,6 @@ def is_named_entity(word: str) -> bool:
     doc = nlp(word)
     return any(ent.label_ in ["GPE", "ORG", "PERSON", "LOC"] for ent in doc.ents)
 
-async def expand_query(query: str, user_id: Optional[str] = None) -> str:
-    """Smarter query expansion with limited, relevant synonyms."""
-    try:
-        corrected = str(TextBlob(query).correct())
-        if fuzz.ratio(query, corrected) > 85:
-            query = corrected
-    except:
-        pass
-
-    expanded = set(query.split())
-    for word in query.split():
-        if not is_named_entity(word) and word.isalpha() and len(word) > 3:
-            syns = wordnet.synsets(word)
-            lemmas = set()
-            for syn in syns:
-                for lemma in syn.lemmas():
-                    if lemma.name().lower() != word.lower():
-                        lemmas.add(lemma.name().replace("_", " "))
-            # Only add the most frequent synonym
-            if lemmas:
-                expanded.add(list(lemmas)[0])
-
-    # Add user preferences if available
-    if user_id:
-        prefs = await database.fetch_one(
-            user_prefs.select().where(user_prefs.c.user_id == user_id)
-        )
-        if prefs and prefs["preferences"]:
-            expanded.update(prefs["preferences"].get("preferred_topics", []))
-
-    # Limit to 10 terms max
-    return " ".join(list(expanded)[:8])
 @app.post("/search")
 async def neural_search(
     request: SearchRequest, 
