@@ -415,7 +415,7 @@ async def neural_search(
                 source=doc["source"],
                 summary=doc["summary"],
                 entities=doc["entities"],
-                score=float(score),
+                score=float(score.item()) if hasattr(score, "item") else float(score),
                 processing_time_ms=gpu_time
             )
             for doc, score in zip(ranked_docs[:request.limit], scores)
