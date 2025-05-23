@@ -132,6 +132,17 @@ class SearchResponse(BaseModel):
     query_analysis: Dict
     hardware: Dict
 
+def convert_numpy_types(obj: Any) -> Any:
+    """Recursively convert numpy types to Python native types"""
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, dict):
+        return {k: convert_numpy_types(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [convert_numpy_types(v) for v in obj]
+    if isinstance(obj, torch.Tensor):
+        return obj.cpu().tolist()
+    return obj
 @app.on_event("startup")
 async def startup():
     await database.connect()
@@ -172,27 +183,37 @@ async def verify_api_key(key: str):
     return result is not None
 
 def gpu_extract_features(text: str) -> Dict:
-    """Extract NLP features using GPU acceleration"""
-    with torch.no_grad(), torch.cuda.amp.autocast():
-        # Entity recognition
-        entities = ner_pipeline(text[:512])
-        
-        # Summarization
-        summary = summarizer(text[:1024], max_length=130)[0]["summary_text"]
-        
-        # Semantic embedding
-        embedding = semantic_model.encode(text, convert_to_tensor=True)
-        
-        # Keywords via noun chunks
-        doc = nlp(text[:10000])
-        keywords = list(set([chunk.text for chunk in doc.noun_chunks]))
-        
-    return {
-        "entities": entities,
-        "summary": summary,
-        "embedding": embedding,
-        "keywords": keywords
+    """Extract NLP features with type-safe conversions"""
+    features = {
+        "entities": [],
+        "summary": "",
+        "embedding": [],
+        "keywords": []
     }
+    
+    try:
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            # Entity recognition with conversion
+            entities = ner_pipeline(text[:512])
+            if entities:
+                features["entities"] = [convert_numpy_types(e) for e in entities]
+            
+            # Summarization
+            summary = summarizer(text[:1024], max_length=130)[0]["summary_text"]
+            features["summary"] = str(summary) if summary else ""
+            
+            # Semantic embedding as list
+            embedding = semantic_model.encode(text, convert_to_tensor=True)
+            features["embedding"] = convert_numpy_types(embedding)
+            
+            # Keywords via noun chunks
+            doc = nlp(text[:10000])
+            features["keywords"] = list(set([str(chunk.text) for chunk in doc.noun_chunks]))
+            
+    except Exception as e:
+        print(f"Feature extraction error: {str(e)}")
+    
+    return features
 
 def advanced_tokenize(query: str) -> List[str]:
     """Tokenize query preserving quoted phrases and numbers."""
@@ -295,27 +316,31 @@ def generate_duckduckgo_documents(query: str) -> List[Dict[str, Any]]:
     return docs
 
 def generate_wikipedia_documents(query: str) -> List[Dict[str, Any]]:
-    """Wikipedia fallback source."""
+    """Wikipedia search with enhanced error handling"""
     docs = []
     try:
         search_results = wikipedia.search(query, results=2)
-        for title in search_results:
+        for title in search_results[:2]:  # Limit to 2 results
             try:
-                page = wikipedia.page(title)
+                page = wikipedia.page(title, auto_suggest=False)
                 content = page.content[:10000]
                 features = gpu_extract_features(content)
                 docs.append({
                     "id": abs(hash(page.url)) % (10**8),
-                    "title": page.title,
-                    "content": content,
-                    "source": page.url,
+                    "title": str(page.title),
+                    "content": str(content),
+                    "source": str(page.url),
                     "source_domain": "wikipedia.org",
                     **features
                 })
+            except wikipedia.DisambiguationError as e:
+                print(f"Wikipedia disambiguation error: {e.options[:3]}")
+            except wikipedia.PageError:
+                print(f"Wikipedia page not found: {title}")
             except Exception as e:
-                print(f"Wikipedia fetch failed: {e}")
+                print(f"Wikipedia processing error: {str(e)}")
     except Exception as e:
-        print(f"Wikipedia search failed: {e}")
+        print(f"Wikipedia search failed: {str(e)}")
     return docs
 
 def generate_documents(query: str) -> List[Dict[str, Any]]:
@@ -327,28 +352,39 @@ def generate_documents(query: str) -> List[Dict[str, Any]]:
     return docs if docs else [create_empty_result(query)]
 
 async def hybrid_search(query: str, documents: List[Dict]) -> Tuple[List[Dict], List[float]]:
-    """Hybrid scoring with phrase and domain weighting."""
+    """Hybrid scoring with type-safe conversions"""
     if not documents:
         return [], []
+    
     valid_docs = [d for d in documents if d.get("content")]
     if not valid_docs:
         return [], []
-    # Phrase bonus: boost docs containing exact query phrase
-    phrase_bonus = np.array([2.0 if query.lower() in doc["content"].lower() else 1.0 for doc in valid_docs])
-    # Domain weighting: boost Wikipedia
-    domain_bonus = np.array([1.5 if doc.get("source_domain") == "wikipedia.org" else 1.0 for doc in valid_docs])
+    
+    # Convert embeddings to numpy arrays
+    embeddings = [np.array(doc["embedding"], dtype=np.float32) for doc in valid_docs]
+    
     # BM25 lexical
     tokenized_docs = [doc["content"].split() for doc in valid_docs]
     bm25 = BM25Okapi(tokenized_docs)
-    lexical_scores = np.array(bm25.get_scores(query.split()))
+    lexical_scores = np.array(bm25.get_scores(query.split()), dtype=np.float32)
+    
     # Semantic
-    query_embed = semantic_model.encode(query, convert_to_tensor=True)
-    doc_embeds = torch.stack([doc["embedding"] for doc in valid_docs])
-    semantic_scores = torch.nn.functional.cosine_similarity(query_embed, doc_embeds).cpu().numpy()
-    # Combine
+    query_embed = semantic_model.encode(query, convert_to_tensor=False)
+    semantic_scores = cosine_similarity([query_embed], embeddings)[0].astype(np.float32)
+    
+    # Phrase and domain bonuses
+    phrase_bonus = np.array([2.0 if query.lower() in doc["content"].lower() else 1.0 
+                           for doc in valid_docs], dtype=np.float32)
+    domain_bonus = np.array([1.5 if doc.get("source_domain") == "wikipedia.org" else 1.0 
+                           for doc in valid_docs], dtype=np.float32)
+    
+    # Combine scores with type conversion
     combined = (0.5 * semantic_scores + 0.5 * lexical_scores) * phrase_bonus * domain_bonus
+    combined = combined.tolist()  # Convert to native list
+    
     ranked_indices = np.argsort(combined)[::-1]
-    return [valid_docs[i] for i in ranked_indices], combined[ranked_indices]
+    return [valid_docs[i] for i in ranked_indices], [combined[i] for i in ranked_indices]
+
 
 def create_empty_result(query: str) -> Dict[str, Any]:
     """Better empty result handling."""
@@ -384,67 +420,58 @@ async def neural_search(
     request: SearchRequest, 
     x_api_key: str = Header(...)
 ):
-    """Main search endpoint with GPU acceleration"""
+    """Main search endpoint with enhanced type safety"""
     if not await verify_api_key(x_api_key):
         raise HTTPException(status_code=401, detail="Invalid API key")
     
-    # Start GPU timer
+    # GPU timing with conversion
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
     torch.cuda.synchronize()
     start_event.record()
     
-    # Process query
-    expanded_query = await expand_query(request.q)
-    documents = generate_documents(expanded_query)
+    try:
+        expanded_query = await expand_query(request.q)
+        documents = generate_documents(expanded_query)
+        ranked_docs, scores = await hybrid_search(expanded_query, documents)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Search processing error: {str(e)}"
+        )
     
-    # Hybrid ranking
-    ranked_docs, scores = await hybrid_search(expanded_query, documents)
-    
-    # End GPU timer
     end_event.record()
     torch.cuda.synchronize()
-    gpu_time = float(start_event.elapsed_time(end_event))  # Ensure this is a Python float
+    gpu_time = float(start_event.elapsed_time(end_event))
 
-    # Robust conversion for all numpy/tensor types
-    def to_pyfloat(val):
-        """Convert any numeric type to Python float with robust error handling"""
-        if val is None:
-            return 0.0
+    # Convert all results to type-safe format
+    safe_results = []
+    for doc, score in zip(ranked_docs[:request.limit], scores):
         try:
-            if hasattr(val, "item"):  # Handles torch.Tensor and numpy.generic
-                return float(val.item())
-            if isinstance(val, (np.floating, np.integer, np.ndarray)):
-                return float(val)
-            return float(val)
-        except (TypeError, ValueError):
-            return 0.0
-
-    py_scores = [to_pyfloat(s) for s in scores]
+            safe_results.append(EnhancedResult(
+                id=int(doc["id"]),
+                title=str(doc["title"]),
+                content=str(doc["content"]),
+                source=str(doc["source"]),
+                summary=str(doc.get("summary", "")),
+                entities=convert_numpy_types(doc.get("entities", [])),
+                score=float(score),
+                processing_time_ms=float(gpu_time)
+            ))
+        except Exception as e:
+            print(f"Result conversion error: {str(e)}")
     
     return SearchResponse(
-        results=[
-            EnhancedResult(
-                id=doc["id"],
-                title=doc["title"],
-                content=doc["content"],
-                source=doc["source"],
-                summary=doc["summary"],
-                entities=doc["entities"],
-                score=to_pyfloat(score),
-                processing_time_ms=to_pyfloat(gpu_time)
-            )
-            for doc, score in zip(ranked_docs[:request.limit], py_scores)
-        ],
+        results=safe_results,
         query_analysis={
-            "original": request.q,
-            "expanded": expanded_query,
-            "terms": expanded_query.split()
+            "original": str(request.q),
+            "expanded": str(expanded_query),
+            "terms": list(map(str, expanded_query.split()))
         },
         hardware={
-            "device": torch.cuda.get_device_name(0),
+            "device": str(torch.cuda.get_device_name(0)) if torch.cuda.is_available() else "CPU",
             "memory_used": int(torch.cuda.memory_allocated(0)),
-            "compute_time_ms": to_pyfloat(gpu_time)
+            "compute_time_ms": float(gpu_time)
         }
     )
 
