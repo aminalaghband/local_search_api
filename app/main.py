@@ -234,50 +234,50 @@ def advanced_tokenize(query: str) -> List[str]:
     return [match.group() for match in matches if match.group()]
 
 async def expand_query(query: str, user_id: Optional[str] = None) -> str:
-    """More focused query expansion for technical topics"""
+    """General query expansion without domain-specific biases"""
     try:
         doc = nlp(query)
         
-        # Identify and preserve key noun phrases
-        noun_phrases = {chunk.text.lower() for chunk in doc.noun_chunks}
-        preserved_terms = noun_phrases | {
+        # Preserve named entities and noun phrases
+        key_terms = {
             ent.text.lower() for ent in doc.ents
         } | {
-            token.text.lower() for token in doc if token.like_num or token.is_title
+            chunk.text.lower() for chunk in doc.noun_chunks
         }
         
-        # Controlled synonym expansion
-        expanded = []
-        for token in advanced_tokenize(query):
-            lower_token = token.lower()
-            
-            if (lower_token in preserved_terms or 
-                any(c.isupper() for c in token) or
-                '-' in token):
-                expanded.append(token)
-                continue
-                
-            # Technical term handling
-            if lower_token in ['philosophy', 'intelligence', 'artificial']:
-                syns = set()
-                for syn in wordnet.synsets(token):
-                    for lemma in syn.lemmas():
-                        if lemma.name().lower() != lower_token:
-                            syns.add(lemma.name().replace('_', ' '))
-                
-                expanded.append(token)
+        tokens = [token.text.lower() for token in doc if len(token.text) > 2]
+        expanded = set(tokens)
+        
+        # Add original terms
+        expanded.update(key_terms)
+        
+        # Basic synonym expansion for non-entity terms
+        for token in tokens:
+            if token not in key_terms:
+                syns = wordnet.synsets(token)
                 if syns:
-                    best_syn = max(syns, key=lambda x: fuzz.ratio(token, x))
-                    if fuzz.ratio(token, best_syn) > 70:
-                        expanded.append(best_syn)
-            else:
-                expanded.append(token)
-                
-        return ' '.join(expanded[:10])  # Limit expansion
+                    # Add only the most relevant synonym
+                    lemmas = set()
+                    for syn in syns[:1]:  # Take only first synset
+                        lemmas.update(lemma.name().replace('_', ' ') 
+                                    for lemma in syn.lemmas()
+                                    if lemma.name().lower() != token)
+                    if lemmas:
+                        expanded.add(list(lemmas)[0])
+        
+        # Add user preferences if available
+        if user_id:
+            prefs = await database.fetch_one(
+                user_prefs.select().where(user_prefs.c.user_id == user_id)
+            )
+            if prefs and prefs["preferences"]:
+                expanded.update(prefs["preferences"].get("preferred_topics", []))
+        
+        return " ".join(list(expanded)[:10])  # Limit expansion size
         
     except Exception as e:
         print(f"Query expansion error: {str(e)}")
-        return query
+        return query  # Return original query if expansion fails
 
 
 def weighted_expand_terms(tokens: List[str]) -> List[str]:
@@ -415,20 +415,18 @@ async def generate_documents_async(query: str) -> List[Dict[str, Any]]:
     return docs if docs else [create_empty_result(query)]
 
 async def hybrid_search(query: str, documents: List[Dict]) -> Tuple[List[Dict], List[float]]:
-    """Enhanced hybrid search for technical queries"""
+    """Generic hybrid search combining semantic and lexical matching"""
     if not documents:
         return [], []
     
     valid_docs = [d for d in documents if d.get("content")]
     if not valid_docs:
         return [], []
-
-    # Technical term detection
-    key_terms = ['philosophy', 'artificial intelligence', 'ai', 'ethics', 'theory']
-    query_terms = [t.lower() for t in query.split()]
+    
+    query_terms = query.lower().split()
     
     try:
-        # Improved query embedding with attention to technical phrases
+        # Query embedding
         with torch.no_grad():
             query_embed = semantic_model.encode(
                 query, 
@@ -442,7 +440,7 @@ async def hybrid_search(query: str, documents: List[Dict]) -> Tuple[List[Dict], 
 
     def _cpu_search_core(query_embed: np.ndarray, valid_docs: List[Dict]):
         try:
-            # Embedding validation with error tolerance
+            # Process document embeddings
             embeddings = []
             for doc in valid_docs:
                 try:
@@ -456,43 +454,28 @@ async def hybrid_search(query: str, documents: List[Dict]) -> Tuple[List[Dict], 
                 except:
                     embeddings.append(np.zeros_like(query_embed))
 
-            # Enhanced BM25 with technical term weighting
-            tokenized_docs = []
-            for doc in valid_docs:
-                tokens = doc["content"].split()
-                # Boost technical terms in document
-                weighted_tokens = []
-                for token in tokens:
-                    if token.lower() in key_terms:
-                        weighted_tokens.extend([token]*3)  # Repeat important terms
-                    else:
-                        weighted_tokens.append(token)
-                tokenized_docs.append(weighted_tokens)
-            
+            # BM25 scoring
+            tokenized_docs = [doc["content"].split() for doc in valid_docs]
             bm25 = BM25Okapi(tokenized_docs)
             lexical_scores = np.array(bm25.get_scores(query_terms), dtype=np.float32)
 
-            # Semantic similarity with error margin
+            # Semantic scoring
             try:
                 semantic_scores = cosine_similarity([query_embed], embeddings)[0].astype(np.float32)
             except:
                 semantic_scores = np.zeros(len(embeddings), dtype=np.float32)
 
-            # Dynamic scoring factors
-            term_boost = np.array([
-                1.5 if any(term in doc["content"].lower() for term in key_terms) else 1.0
-                for doc in valid_docs
-            ], dtype=np.float32)
-            
-            title_boost = np.array([
-                2.0 if any(term in doc.get("title", "").lower() for term in key_terms) else 1.0
+            # Balanced scoring with title relevance
+            title_relevance = np.array([
+                1.5 if any(term in doc.get("title", "").lower() for term in query_terms) else 1.0
                 for doc in valid_docs
             ], dtype=np.float32)
 
+            # Combine scores with balanced weights
             combined = (
-                (0.7 * semantic_scores) + 
-                (0.3 * lexical_scores)
-            ) * title_boost * term_boost
+                (0.5 * semantic_scores) + 
+                (0.5 * lexical_scores)
+            ) * title_relevance
 
             return combined.tolist()
         
@@ -509,7 +492,7 @@ async def hybrid_search(query: str, documents: List[Dict]) -> Tuple[List[Dict], 
                 query_embed,
                 valid_docs
             )
-            combined = await asyncio.wait_for(future, timeout=15.0)  # Increased timeout
+            combined = await asyncio.wait_for(future, timeout=15.0)
 
             if not combined:
                 return [], []
