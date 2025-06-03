@@ -402,12 +402,16 @@ def generate_wikipedia_documents(query: str) -> List[Dict[str, Any]]:
         print(f"Wikipedia search failed: {str(e)}")
     return docs
 
-def generate_documents(query: str) -> List[Dict[str, Any]]:
-    """Aggregate from multiple sources with error handling."""
+async def generate_documents_async(query: str) -> List[Dict[str, Any]]:
+    """Aggregate from multiple sources in parallel using asyncio and thread pool."""
+    loop = asyncio.get_event_loop()
+    results = await asyncio.gather(
+        loop.run_in_executor(None, generate_duckduckgo_documents, query),
+        loop.run_in_executor(None, generate_wikipedia_documents, query)
+    )
     docs = []
-    docs += generate_duckduckgo_documents(query)
-    docs += generate_wikipedia_documents(query)
-    # Add more sources here as needed
+    for result in results:
+        docs += result
     return docs if docs else [create_empty_result(query)]
 
 async def hybrid_search(query: str, documents: List[Dict]) -> Tuple[List[Dict], List[float]]:
@@ -566,26 +570,27 @@ async def neural_search(
     request: SearchRequest, 
     x_api_key: str = Header(...)
 ):
-    """Main search endpoint with enhanced type safety"""
+    """Main search endpoint with async document fetching and improved error handling."""
     if not await verify_api_key(x_api_key):
         raise HTTPException(status_code=401, detail="Invalid API key")
-    
+
     # GPU timing with conversion
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
     torch.cuda.synchronize()
     start_event.record()
-    
+
     try:
-        expanded_query = await expand_query(request.q)
-        documents = generate_documents(expanded_query)
+        expanded_query = await expand_query(request.q, request.user_id)
+        documents = await generate_documents_async(expanded_query)
         ranked_docs, scores = await hybrid_search(expanded_query, documents)
     except Exception as e:
+        print(f"Search processing error: {str(e)}")
         raise HTTPException(
             status_code=500,
             detail=f"Search processing error: {str(e)}"
         )
-    
+
     end_event.record()
     torch.cuda.synchronize()
     gpu_time = float(start_event.elapsed_time(end_event))
@@ -606,7 +611,12 @@ async def neural_search(
             ))
         except Exception as e:
             print(f"Result conversion error: {str(e)}")
-    
+
+    # Free GPU memory after search
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
+
     return SearchResponse(
         results=safe_results,
         query_analysis={
