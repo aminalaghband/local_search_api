@@ -19,6 +19,15 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # 2. Install Python packages with pinned versions
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir \
+    huggingface-hub==0.22.2 \
+    -r requirements.txt \
+    --extra-index-url https://download.pytorch.org/whl/cu121 && \
+    pip cache purge
+
+# 3. Download spaCy model
+RUN python -m spacy download en_core_web_sm
 COPY requirements.txt .
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir \
