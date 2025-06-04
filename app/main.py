@@ -325,38 +325,70 @@ async def expand_query(query: str, user_id: Optional[str] = None) -> str:
     return " ".join(list(expanded)[:10])
 
 def generate_duckduckgo_documents(query: str) -> List[Dict[str, Any]]:
-    """DuckDuckGo scraping with error handling."""
+    """DuckDuckGo scraping with enhanced error handling and content extraction."""
     docs = []
     search_url = "https://html.duckduckgo.com/html/"
     client = httpx.Client(
-        headers={"User-Agent": "Mozilla/5.0"},
+        headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        },
         timeout=30.0,
         follow_redirects=True
     )
+    
     try:
-        resp = client.post(search_url, data={"q": query})
+        resp = client.post(search_url, data={"q": query, "kl": "us-en"})  # Add language/region hint
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
-        results = soup.find_all("div", class_="result", limit=10)
-        if not results:
-            results = soup.find_all("div", class_="web-result")
-        for res in results:
+        
+        # Try multiple result container classes
+        results = []
+        for class_name in ["result", "web-result", "links_main", "result__body"]:
+            results.extend(soup.find_all("div", class_=class_name, limit=10))
+            
+        for res in results[:10]:  # Limit to top 10 results
             try:
-                link_tag = res.find("a", class_="result__a") or res.find("a", class_="web-result__title")
+                # Extract link and title
+                link_tag = (res.find("a", class_="result__a") or 
+                          res.find("a", class_="web-result__title") or
+                          res.find("a", href=True))
                 if not link_tag:
                     continue
+                    
                 link = link_tag.get("href", "")
+                if not link or link.startswith(('javascript:', 'data:', '#')):
+                    continue
+                    
                 title = link_tag.get_text(strip=True)
-                snippet = res.find("div", class_="result__snippet") or res.find("div", class_="web-result__snippet")
-                snippet = snippet.get_text(strip=True) if snippet else ""
-                content = snippet
-                try:
-                    downloaded = fetch_url(link, timeout=5.0)
-                    if downloaded:
-                        content = extract(downloaded) or snippet
-                except Exception:
-                    pass
+                
+                # Extract snippet/description
+                snippet = None
+                for snippet_class in ["result__snippet", "web-result__snippet", "result__body"]:
+                    snippet_tag = res.find("div", class_=snippet_class)
+                    if snippet_tag:
+                        snippet = snippet_tag.get_text(strip=True)
+                        break
+                        
+                content = snippet or ""
+                
+                # Try to fetch full content if snippet is short
+                if len(content) < 100:
+                    try:
+                        downloaded = fetch_url(link, timeout=5.0)
+                        if downloaded:
+                            extracted = extract(downloaded)
+                            if extracted and len(extracted) > len(content):
+                                content = extracted
+                    except Exception as e:
+                        print(f"Content fetch error for {link}: {e}")
+                
+                if not content:  # Skip if no content available
+                    continue
+                    
+                # Extract features
                 features = gpu_extract_features(content)
+                
                 docs.append({
                     "id": abs(hash(link)) % (10**8),
                     "title": title[:500],
@@ -365,13 +397,17 @@ def generate_duckduckgo_documents(query: str) -> List[Dict[str, Any]]:
                     "source_domain": get_domain(link),
                     **features
                 })
+                
             except Exception as e:
-                print(f"DuckDuckGo result error: {e}")
+                print(f"DuckDuckGo result processing error: {str(e)}")
                 continue
+                
     except Exception as e:
-        print(f"DuckDuckGo search failed: {e}")
+        print(f"DuckDuckGo search failed: {str(e)}")
+        
     finally:
         client.close()
+        
     return docs
 
 def generate_wikipedia_documents(query: str) -> List[Dict[str, Any]]:
@@ -403,15 +439,22 @@ def generate_wikipedia_documents(query: str) -> List[Dict[str, Any]]:
     return docs
 
 async def generate_documents_async(query: str) -> List[Dict[str, Any]]:
-    """Aggregate from multiple sources in parallel using asyncio and thread pool."""
+    """Aggregate from multiple sources with prioritized DuckDuckGo results"""
     loop = asyncio.get_event_loop()
-    results = await asyncio.gather(
-        loop.run_in_executor(None, generate_duckduckgo_documents, query),
-        loop.run_in_executor(None, generate_wikipedia_documents, query)
-    )
-    docs = []
-    for result in results:
-        docs += result
+    
+    # First try DuckDuckGo
+    ddg_docs = await loop.run_in_executor(None, generate_duckduckgo_documents, query)
+    
+    # If we have enough DuckDuckGo results, return them
+    if len(ddg_docs) >= 5:  # Good number of primary results
+        return ddg_docs
+        
+    # Otherwise, supplement with Wikipedia
+    wiki_docs = await loop.run_in_executor(None, generate_wikipedia_documents, query)
+    
+    # Combine results with DuckDuckGo first
+    docs = ddg_docs + wiki_docs[:2]  # Limit Wikipedia supplementary results
+    
     return docs if docs else [create_empty_result(query)]
 
 async def hybrid_search(query: str, documents: List[Dict]) -> Tuple[List[Dict], List[float]]:
