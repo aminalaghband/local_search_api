@@ -1,37 +1,33 @@
+import asyncio
+import gc
+import json
+import re
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, List, Any, Optional, Tuple
 import torch
-from fastapi import FastAPI, Header, HTTPException, status, Request
-from pydantic import BaseModel
+from torch.cuda.amp import autocast
 import httpx
-import os
-import databases
-import sqlalchemy
-import secrets
 import spacy
-from typing import List, Dict, Any, Optional
-from sqlalchemy import create_engine
+from spacy.cli import download
+import wikipedia
+import nltk
 from bs4 import BeautifulSoup
+import numpy as np
+from textblob import TextBlob
+from thefuzz import fuzz
+from nltk.corpus import wordnet
+from sentence_transformers import SentenceTransformer
+from rank_bm25 import BM25Okapi
+from sklearn.metrics.pairwise import cosine_similarity
+from fastapi import FastAPI, Header, HTTPException, status, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import sqlalchemy
+import databases
 from trafilatura import fetch_url, extract
 from langdetect import detect
-from textblob import TextBlob
-from nltk.corpus import wordnet
-from thefuzz import fuzz
+import os
 from datetime import datetime
-import nltk
-from sentence_transformers import SentenceTransformer
-from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
-from sklearn.metrics.pairwise import cosine_similarity
-from rank_bm25 import BM25Okapi
-import numpy as np
-from urllib.parse import urlparse
-from fastapi.middleware.cors import CORSMiddleware
-from typing import Tuple
-from typing import Any, Optional
-import spacy
-import re
-import wikipedia
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
-import gc
-import asyncio
 
 # Initialize CUDA
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -56,23 +52,33 @@ GENERATION_CONFIG = {
 # Initialize models with mixed precision
 semantic_model = SentenceTransformer('all-MiniLM-L6-v2').to(DEVICE)
 
-# Initialize Qwen for enhanced search understanding
+# LLM Setup and Configuration
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+
+# Global variables for LLM
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+MODEL_NAME = "Qwen/Qwen1.5-0.5B"
+MAX_MEMORY = {0: "4GiB"}  # Adjust based on RTX 4070 memory
+
+# Initialize LLM components
 try:
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    
+    print(f"Loading {MODEL_NAME} on {DEVICE}...")
     qwen_tokenizer = AutoTokenizer.from_pretrained(
-        "Qwen/Qwen1.5-0.5B-Chat",
+        MODEL_NAME,
         trust_remote_code=True
     )
     qwen_model = AutoModelForCausalLM.from_pretrained(
-        "Qwen/Qwen1.5-0.5B-Chat",
+        MODEL_NAME,
         device_map="auto",
+        torch_dtype=torch.float16,
+        max_memory=MAX_MEMORY,
         trust_remote_code=True,
-        torch_dtype=torch.float16
-    )
-    print("✓ Qwen model loaded successfully")
+        use_cache=True
+    ).eval()
+    print("LLM loaded successfully")
 except Exception as e:
-    print(f"⚠️ Qwen model loading failed: {e}")
+    print(f"Failed to load LLM: {str(e)}")
     qwen_model = None
     qwen_tokenizer = None
 
@@ -806,18 +812,23 @@ async def neural_search(
         # Add scores to documents
         for doc, score in zip(ranked_docs, scores):
             doc["score"] = float(score)
+            doc["processing_time_ms"] = 0.0  # Will update with actual time later
             
         # Enhance results with LLM if available
         if qwen_model and len(ranked_docs) > 0:
-            ranked_docs = enhance_search_with_llm(request.q, ranked_docs)
-            scores = [doc.get("score", 0.0) for doc in ranked_docs]
-            
+            try:
+                ranked_docs = enhance_search_with_llm(request.q, ranked_docs)
+                # Update scores with LLM insights
+                for doc in ranked_docs:
+                    if "llm_score" in doc:
+                        doc["score"] = (doc["score"] + doc["llm_score"]) / 2.0
+            except Exception as e:
+                print(f"LLM enhancement failed: {str(e)}")
+                
     except Exception as e:
-        print(f"Search processing error: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Search processing error: {str(e)}"
-        )
+        print(f"Search pipeline error: {str(e)}")
+        ranked_docs = [create_empty_result(request.q)]
+        scores = [0.0]
 
     end_event.record()
     torch.cuda.synchronize()
@@ -826,19 +837,23 @@ async def neural_search(
     # Convert all results to type-safe format
     safe_results = []
     for doc, score in zip(ranked_docs[:request.limit], scores):
+        # Update processing time
+        doc["processing_time_ms"] = gpu_time / len(ranked_docs)
+        
         try:
             safe_results.append(EnhancedResult(
-                id=int(doc["id"]),
-                title=str(doc["title"]),
-                content=str(doc["content"]),
+                id=doc["id"],
+                title=str(doc["title"])[:500],
+                content=str(doc["content"])[:10000],
                 source=str(doc["source"]),
-                summary=str(doc.get("summary", "")),
-                entities=convert_numpy_types(doc.get("entities", [])),
-                score=float(score),
-                processing_time_ms=float(gpu_time)
+                summary=str(doc.get("summary", ""))[:1000],
+                entities=doc.get("entities", []),
+                score=float(doc["score"]),
+                processing_time_ms=float(doc["processing_time_ms"])
             ))
         except Exception as e:
             print(f"Result conversion error: {str(e)}")
+            continue
 
     # Free GPU memory after search
     if torch.cuda.is_available():
@@ -887,113 +902,144 @@ async def system_status():
         }
     }
 
-def enhance_search_with_llm(query: str, top_results: List[Dict]) -> List[Dict]:
-    """Enhanced LLM-based result evaluation with factual query handling"""
-    if not qwen_model or not qwen_tokenizer or not top_results:
-        return top_results
+@app.get("/search")
+async def search(
+    query: str,
+    limit: int = 10,
+    min_score: float = 0.0,
+    use_llm: bool = True
+) -> Dict:
+    """
+    Enhanced search endpoint that uses LLM throughout the pipeline
+    """
+    try:
+        if use_llm:
+            results = await hybrid_search_with_llm(query, limit)
+        else:
+            results = await hybrid_search(query, limit)
+
+        # Filter by minimum score
+        if min_score > 0:
+            if use_llm:
+                results = [r for r in results 
+                          if r.get("llm_ranking", {}).get("final_score", 0) >= min_score]
+            else:
+                results = [r for r in results if r.get("score", 0) >= min_score]
+
+        return {
+            "query": query,
+            "results": results,
+            "total": len(results),
+            "llm_enhanced": use_llm
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Search failed: {str(e)}"
+        )
+
+@app.get("/analyze-query")
+async def analyze_query_endpoint(query: str) -> Dict:
+    """
+    Endpoint to get LLM analysis of a search query
+    """
+    try:
+        analysis = await llm_analyze_query(query)
+        return {
+            "query": query,
+            "analysis": analysis
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Query analysis failed: {str(e)}"
+        )
+
+# Memory management for LLM
+def manage_gpu_memory():
+    """Manage GPU memory usage for the LLM"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        # Set memory fraction to use
+        torch.cuda.set_per_process_memory_fraction(0.8, DEVICE)  # Use 80% of available memory
+
+# Middleware to manage memory between requests
+@app.middleware("http")
+async def manage_resources(request: Request, call_next):
+    """Manage GPU memory between requests"""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    response = await call_next(request)
+    return response
+
+async def hybrid_search_with_llm(query: str, limit: int = 10) -> List[Dict]:
+    """Perform hybrid search with LLM enhancement"""
+    try:
+        # Get initial results
+        documents = await generate_documents_async(query)
+        ranked_docs, scores = await hybrid_search(query, documents)
+        
+        if not ranked_docs:
+            return []
+            
+        # Enhance with LLM
+        if qwen_model and qwen_tokenizer:
+            enhanced_docs = rerank_with_llm(query, ranked_docs[:limit])
+            return enhanced_docs[:limit]
+        
+        return ranked_docs[:limit]
+        
+    except Exception as e:
+        print(f"LLM hybrid search failed: {str(e)}")
+        return []
+
+def rerank_with_llm(query: str, docs: List[Dict]) -> List[Dict]:
+    """Use LLM to rerank search results"""
+    if not qwen_model or not qwen_tokenizer:
+        return docs
         
     try:
-        # Analyze query type
-        query_analysis = analyze_query_type(query)
-        
-        # Create a context-aware prompt
-        if query_analysis["is_question"]:
-            if query_analysis["temporal_context"] == "current":
-                prompt = f"""As a search evaluator in 2025, analyze these results for the question: "{query}"
-                Focus on:
-                1. Current and up-to-date information (as of 2025)
-                2. Direct answers to the question
-                3. Source authority and reliability
-                4. Factual accuracy
-                
-                For each result, determine:
-                1. Does it directly answer the question? (0-10)
-                2. Is the information current? (0-10)
-                3. Is the source authoritative? (0-10)
-                
-                Evaluate each result and assign a combined score (0-10).
-                """
-            else:
-                prompt = f"""As a search evaluator, analyze these results for the question: "{query}"
-                Focus on:
-                1. Direct answers to the question
-                2. Source authority and reliability
-                3. Factual accuracy and detail
-                4. Historical context when relevant
-                
-                For each result, determine:
-                1. Does it directly answer the question? (0-10)
-                2. Is the source authoritative? (0-10)
-                3. Is the information complete? (0-10)
-                
-                Evaluate each result and assign a combined score (0-10).
-                """
-        else:
-            prompt = f"""As a search evaluator, analyze these results for the query: "{query}"
-            Focus on:
-            1. Relevance to the query
-            2. Information quality and completeness
-            3. Source reliability
-            
-            Rate each result's relevance from 0-10.
-            """
-        
-        # Add result summaries to prompt
-        for i, doc in enumerate(top_results[:5]):
-            prompt += f"\n\nResult {i+1}:\n"
-            prompt += f"Title: {doc['title']}\n"
-            prompt += f"Source: {doc['source_domain']}\n"
-            prompt += f"Summary: {doc['summary'][:200]}...\n"
-        
-        # Generate evaluation
-        with torch.no_grad(), torch.cuda.amp.autocast():
-            inputs = qwen_tokenizer(prompt, return_tensors="pt").to(DEVICE)
-            output = qwen_model.generate(
-                **inputs,
-                max_new_tokens=GENERATION_CONFIG["max_new_tokens"],
-                temperature=GENERATION_CONFIG["temperature"],
-                top_p=GENERATION_CONFIG["top_p"],
-                do_sample=GENERATION_CONFIG["do_sample"]
-            )
-            evaluation = qwen_tokenizer.decode(output[0], skip_special_tokens=True)
-        
-        # Extract scores and boost factual answers
-        scores = []
-        for line in evaluation.split("\n"):
-            if "score:" in line.lower() or "combined:" in line.lower():
-                try:
-                    score = float(re.search(r"(\d+\.?\d*)", line).group(1))
-                    scores.append(min(10.0, max(0.0, score)))
-                except:
-                    scores.append(5.0)
-        
-        # Adjust result ranking
-        if scores and len(scores) == len(top_results[:5]):
-            # Normalize scores
-            max_score = max(scores)
-            min_score = min(scores)
-            score_range = max_score - min_score if max_score != min_score else 1.0
-            
-            # Apply scores with factual query boost
-            for i, score in enumerate(scores):
-                normalized_score = (score - min_score) / score_range
-                original_score = top_results[i].get("score", 0)
-                
-                # Higher LLM weight for factual queries
-                if query_analysis["is_question"]:
-                    llm_weight = 0.4  # 40% LLM, 60% original for factual queries
-                else:
-                    llm_weight = 0.3  # 30% LLM, 70% original for other queries
-                    
-                top_results[i]["score"] = (
-                    (1 - llm_weight) * original_score + 
-                    llm_weight * normalized_score
+        for doc in docs:
+            prompt = f"""Analyze the relevance of this document to the search query.
+Query: "{query}"
+Title: "{doc['title']}"
+Content: "{doc['content'][:500]}..."
+
+Rate on a scale of 0-1 where 1 means perfectly relevant and 0 means completely irrelevant.
+Consider:
+1. Query intent match
+2. Content freshness
+3. Source authority
+4. Information completeness
+
+Return only the numerical score between 0 and 1.
+"""
+            with torch.cuda.amp.autocast():
+                inputs = qwen_tokenizer(prompt, return_tensors="pt").to(DEVICE)
+                output = qwen_model.generate(
+                    **inputs,
+                    max_new_tokens=8,
+                    temperature=0.1,
+                    do_sample=False,
+                    return_dict_in_generate=True,
+                    output_scores=True,
+                    pad_token_id=qwen_tokenizer.pad_token_id
                 )
-            
-            # Re-sort results
-            top_results.sort(key=lambda x: x.get("score", 0), reverse=True)
-            
-    except Exception as e:
-        print(f"LLM enhancement error: {str(e)}")
+                
+                score_text = qwen_tokenizer.decode(output.sequences[0], skip_special_tokens=True)
+                try:
+                    score = float(score_text.strip())
+                    score = max(0.0, min(1.0, score))  # Clamp between 0 and 1
+                    doc["llm_score"] = score
+                except:
+                    doc["llm_score"] = 0.5  # Default score
+                    
+        # Sort by LLM score
+        docs.sort(key=lambda x: x.get("llm_score", 0), reverse=True)
+        return docs
         
-    return top_results
+    except Exception as e:
+        print(f"LLM reranking failed: {str(e)}")
+        return docs
