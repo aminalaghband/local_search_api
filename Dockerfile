@@ -17,7 +17,7 @@ RUN apt-get update && \
     ln -s /usr/bin/python3 /usr/bin/python && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
-
+COPY requirements.txt .
 # 2. Install Python packages with pinned versions
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir \
