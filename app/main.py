@@ -227,43 +227,54 @@ def gpu_extract_features(text: str) -> Dict:
     return features
 
 def advanced_tokenize(query: str) -> List[str]:
-    """More precise tokenization preserving key phrases"""
-    # Match: quoted phrases, hyphenated terms, and key concepts
-    pattern = r'\"(.+?)\"|(\b[A-Z][a-z]+\s[A-Z][a-z]+\b)|(\w+-\w+)|\b\w{3,}\b'
+    """More precise tokenization preserving exact terms and phrases"""
+    # Match: quoted phrases, technical terms, hyphenated terms, and exact words
+    pattern = r'\"(.+?)\"|([A-Za-z]+\d+|\d+[A-Za-z]+)|(\w+-\w+)|([A-Z][a-z]+\s[A-Z][a-z]+|\b\w{2,}\b)'
     matches = re.finditer(pattern, query)
-    return [match.group() for match in matches if match.group()]
+    return [match.group().strip('"') for match in matches if match.group()]
 
 async def expand_query(query: str, user_id: Optional[str] = None) -> str:
-    """General query expansion without domain-specific biases"""
+    """Advanced query expansion that preserves original terms"""
     try:
+        # First preserve original tokens exactly as they are
+        original_tokens = set(advanced_tokenize(query))
+        
         doc = nlp(query)
         
-        # Preserve named entities and noun phrases
+        # Preserve named entities and technical terms
         key_terms = {
-            ent.text.lower() for ent in doc.ents
+            ent.text for ent in doc.ents
         } | {
-            chunk.text.lower() for chunk in doc.noun_chunks
+            token.text for token in doc 
+            if token.like_num or token.is_upper or '-' in token.text
         }
         
-        tokens = [token.text.lower() for token in doc if len(token.text) > 2]
-        expanded = set(tokens)
+        expanded = original_tokens | key_terms
         
-        # Add original terms
-        expanded.update(key_terms)
+        # Only expand common words (not technical terms or entities)
+        common_words = [
+            token.text.lower() for token in doc 
+            if (len(token.text) > 2 and 
+                token.text not in key_terms and
+                not token.like_num and 
+                not token.is_upper and
+                token.text in token.text.lower())  # Only expand if case matches
+        ]
         
-        # Basic synonym expansion for non-entity terms
-        for token in tokens:
-            if token not in key_terms:
-                syns = wordnet.synsets(token)
+        # Careful synonym expansion
+        for word in common_words:
+            if word not in expanded:  # Don't expand terms we already have
+                syns = wordnet.synsets(word)
                 if syns:
-                    # Add only the most relevant synonym
-                    lemmas = set()
-                    for syn in syns[:1]:  # Take only first synset
-                        lemmas.update(lemma.name().replace('_', ' ') 
-                                    for lemma in syn.lemmas()
-                                    if lemma.name().lower() != token)
-                    if lemmas:
-                        expanded.add(list(lemmas)[0])
+                    # Add only the most relevant synonym if similarity is high
+                    syn = syns[0]
+                    lemmas = [
+                        lemma.name().replace('_', ' ') 
+                        for lemma in syn.lemmas()
+                        if lemma.name().lower() != word
+                    ]
+                    if lemmas and fuzz.ratio(word, lemmas[0]) > 70:  # Only add if similar
+                        expanded.add(lemmas[0])
         
         # Add user preferences if available
         if user_id:
@@ -271,9 +282,18 @@ async def expand_query(query: str, user_id: Optional[str] = None) -> str:
                 user_prefs.select().where(user_prefs.c.user_id == user_id)
             )
             if prefs and prefs["preferences"]:
-                expanded.update(prefs["preferences"].get("preferred_topics", []))
+                # Only add relevant preferences
+                pref_terms = prefs["preferences"].get("preferred_topics", [])
+                expanded.update(
+                    term for term in pref_terms
+                    if any(fuzz.partial_ratio(term, t) > 80 for t in original_tokens)
+                )
         
-        return " ".join(list(expanded)[:10])  # Limit expansion size
+        # Ensure original terms are preserved in final result
+        final_terms = list(original_tokens)  # Start with original terms
+        final_terms.extend(t for t in expanded if t not in original_tokens)
+        
+        return " ".join(final_terms[:10])  # Limit expansion size
         
     except Exception as e:
         print(f"Query expansion error: {str(e)}")
@@ -439,23 +459,38 @@ def generate_wikipedia_documents(query: str) -> List[Dict[str, Any]]:
     return docs
 
 async def generate_documents_async(query: str) -> List[Dict[str, Any]]:
-    """Aggregate from multiple sources with prioritized DuckDuckGo results"""
+    """Aggregate from multiple sources with strong prioritization of web results"""
     loop = asyncio.get_event_loop()
     
-    # First try DuckDuckGo
+    # First try DuckDuckGo with more thorough scraping
     ddg_docs = await loop.run_in_executor(None, generate_duckduckgo_documents, query)
     
-    # If we have enough DuckDuckGo results, return them
-    if len(ddg_docs) >= 5:  # Good number of primary results
-        return ddg_docs
+    # Filter out low-quality results and duplicates
+    filtered_docs = []
+    seen_domains = set()
+    
+    for doc in ddg_docs:
+        domain = get_domain(doc["source"])
         
-    # Otherwise, supplement with Wikipedia
-    wiki_docs = await loop.run_in_executor(None, generate_wikipedia_documents, query)
+        # Skip if no meaningful content or from same domain
+        if (len(doc.get("content", "")) < 50 or  # Too short
+            domain in seen_domains or  # Duplicate domain
+            not domain or  # Invalid domain
+            "wikipedia.org" in domain):  # Skip Wikipedia from DuckDuckGo
+            continue
+            
+        filtered_docs.append(doc)
+        seen_domains.add(domain)
+        
+        if len(filtered_docs) >= 8:  # Good number of diverse results
+            return filtered_docs
     
-    # Combine results with DuckDuckGo first
-    docs = ddg_docs + wiki_docs[:2]  # Limit Wikipedia supplementary results
+    # If we don't have enough good results, try Wikipedia as backup
+    if len(filtered_docs) < 3:
+        wiki_docs = await loop.run_in_executor(None, generate_wikipedia_documents, query)
+        filtered_docs.extend(wiki_docs[:1])  # Only add 1 Wikipedia result max
     
-    return docs if docs else [create_empty_result(query)]
+    return filtered_docs if filtered_docs else [create_empty_result(query)]
 
 async def hybrid_search(query: str, documents: List[Dict]) -> Tuple[List[Dict], List[float]]:
     """Generic hybrid search combining semantic and lexical matching"""
