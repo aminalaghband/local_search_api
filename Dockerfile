@@ -27,10 +27,13 @@ RUN pip install --upgrade pip && \
     --extra-index-url https://download.pytorch.org/whl/cu121 && \
     pip cache purge
 
-# 3. Download models
-RUN python3 -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')" && \
-    python3 -m spacy download en_core_web_trf && \
-    python3 -m nltk.downloader punkt wordnet
+# 3. Download models and create cache directories
+RUN mkdir -p /root/.cache/torch/hub/checkpoints && \
+    mkdir -p /root/.cache/huggingface && \
+    python3 -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')" && \
+    python3 -m spacy download en_core_web_sm && \
+    python3 -m nltk.downloader punkt wordnet && \
+    python3 -c "import nltk; nltk.download('punkt'); nltk.download('wordnet')"
 
 # 4. Copy application
 COPY ./app /app

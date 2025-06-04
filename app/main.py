@@ -43,6 +43,7 @@ from pydantic import BaseModel
 # Database imports
 import sqlalchemy
 import databases
+from sqlalchemy import create_engine
 
 # Initialize CUDA
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -113,8 +114,9 @@ try:
     nlp = spacy.load("en_core_web_sm")
 except OSError:
     # If the model isn't downloaded, download it first
-    from spacy.cli import download
-    download("en_core_web_sm")
+    print("Downloading spaCy model...")
+    import subprocess
+    subprocess.run(["python", "-m", "spacy", "download", "en_core_web_sm"], check=True)
     nlp = spacy.load("en_core_web_sm")
 # Database setup
 database = databases.Database(DATABASE_URL)
