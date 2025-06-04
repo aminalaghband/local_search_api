@@ -169,10 +169,9 @@ app.add_middleware(
 )
 
 class SearchRequest(BaseModel):
-    q: str
-    user_id: Optional[str] = None
-    limit: Optional[int] = 10
-    neural: Optional[bool] = True
+    query: str
+    max_results: int = 5  # Optional, defaults to 5
+    include_temporal: bool = True  # Optional, whether to include temporal context
 
 class EnhancedResult(BaseModel):
     id: int
@@ -1062,3 +1061,312 @@ Return only the numerical score between 0 and 1.
     except Exception as e:
         print(f"LLM reranking failed: {str(e)}")
         return docs
+
+async def llm_analyze_query(query: str) -> Dict:
+    """Analyze query intent and extract key information using LLM"""
+    # First check for direct time queries using pattern matching
+    time_patterns = [
+        r'\b(?:what|current|)\s*time\s*(?:is|ist)\s*(?:it|now)?\??',
+        r'\btime\s*now\b',
+        r'\bcurrent\s*time\b'
+    ]
+    
+    for pattern in time_patterns:
+        if re.match(pattern, query.lower().strip()):
+            current_time = datetime.now().strftime("%I:%M %p")
+            return {
+                "query": query,
+                "intent": "time",
+                "type": "direct_time_query",
+                "temporal_context": "current",
+                "time_response": current_time,
+                "requires_realtime": True
+            }
+
+    if not qwen_model or not qwen_tokenizer:
+        return {
+            "intent": "unknown",
+            "type": "general",
+            "temporal_context": "unknown"
+        }
+
+    try:
+        # Create analysis prompt
+        prompt = f"""Analyze this search query: "{query}"
+Consider:
+- Query type (question, command, statement)
+- Main intent (time, location, definition, fact, etc.)
+- Key entities
+- Temporal context (current, past, future)
+- Is this asking for the current time? (yes/no)
+"""
+        
+        inputs = qwen_tokenizer(prompt, return_tensors="pt").to(DEVICE)
+        with torch.no_grad():
+            output = qwen_model.generate(
+                **inputs,
+                max_new_tokens=100,
+                temperature=0.7,
+                do_sample=True
+            )
+        
+        analysis = qwen_tokenizer.decode(output[0], skip_special_tokens=True)
+        
+        # Extract structured info
+        doc = nlp(query)
+        entities = [{
+            "text": ent.text,
+            "label": ent.label_
+        } for ent in doc.ents]
+        
+        # Check for temporal keywords
+        temporal_words = {
+            "now": "current",
+            "current": "current", 
+            "today": "current",
+            "tonight": "current",
+            "yesterday": "past",
+            "tomorrow": "future",
+            "last": "past",
+            "next": "future",
+            "time": "current"
+        }
+        
+        temporal_context = "unknown"
+        requires_realtime = False
+        
+        for word in query.lower().split():
+            if word in temporal_words:
+                temporal_context = temporal_words[word]
+                if temporal_context == "current":
+                    requires_realtime = True
+                break
+                
+        return {
+            "query": query,
+            "llm_analysis": analysis,
+            "entities": entities,
+            "temporal_context": temporal_context,
+            "requires_realtime": requires_realtime,
+            "is_temporal": any(word in query.lower() for word in temporal_words.keys()),
+            "is_question": "?" in query or doc[0].text.lower() in ["what", "when", "where", "who", "how"]
+        }
+        
+    except Exception as e:
+        print(f"Query analysis failed: {str(e)}")
+        return {
+            "error": str(e),
+            "query": query
+        }
+@app.post("/search")
+async def search(request: SearchRequest) -> Dict:
+    """Search endpoint that handles both regular and temporal queries"""
+    try:
+        # Analyze query intent
+        analysis = await llm_analyze_query(request.query)
+        
+        # Handle direct time queries with real-time response
+        if analysis.get("type") == "direct_time_query":
+            return {
+                "results": [{
+                    "title": "Current Time",
+                    "url": "",
+                    "content": f"The current time is {analysis['time_response']}",
+                    "score": 1.0,
+                    "type": "temporal_response"
+                }],
+                "analysis": analysis,
+                "meta": {
+                    "response_type": "temporal",
+                    "timestamp": datetime.now().isoformat()
+                }
+            }
+        
+        # For queries requiring real-time but not direct time
+        if analysis.get("requires_realtime", False):
+            current_time = datetime.now().strftime("%I:%M %p")
+            current_date = datetime.now().strftime("%B %d, %Y")
+            
+            temporal_context = {
+                "current_time": current_time,
+                "current_date": current_date,
+                "day_of_week": datetime.now().strftime("%A")
+            };
+            
+            # Continue with regular search but include temporal context
+            regular_results = []
+            try:
+                # Perform regular search...
+                pass
+            except Exception as search_error:
+                print(f"Regular search failed: {str(search_error)}")
+            
+            return {
+                "results": regular_results,
+                "analysis": analysis,
+                "meta": {
+                    "temporal_context": temporal_context,
+                    "timestamp": datetime.now().isoformat()
+                }
+            }
+        
+        # Regular search pipeline for non-temporal queries
+        results = []
+        
+        # Only include wikipedia results if query is not temporal
+        if not analysis.get("is_temporal", False):
+            try:
+                wiki_results = await get_wikipedia_results(request.query, max_results=2)
+                results.extend(wiki_results)
+            except Exception as wiki_error:
+                print(f"Wikipedia search failed: {str(wiki_error)}")
+        
+        # Consider temporal context when fetching DuckDuckGo results  
+        try:
+            ddg_results = await get_ddg_results(
+                request.query, 
+                max_results=5 if analysis.get("is_temporal", False) else 3
+            )
+            results.extend(ddg_results)
+        except Exception as ddg_error:
+            print(f"DuckDuckGo search failed: {str(ddg_error)}")
+            
+        if not results:
+            return {
+                "results": [],
+                "error": "No results found",
+                "analysis": analysis
+            }
+            
+        # Sort by score and temporal relevance
+        results.sort(key=lambda x: x.get("score", 0), reverse=True)
+        
+        return {
+            "results": results,
+            "analysis": analysis,
+            "meta": {
+                "response_type": "search",
+                "timestamp": datetime.now().isoformat()
+            }
+        }
+        
+    except Exception as e:
+        return {
+            "error": str(e),
+            "query": request.query
+        }
+
+async def get_wikipedia_results(query: str, max_results: int = 2) -> List[Dict]:
+    """Get relevant results from Wikipedia"""
+    try:
+        wiki_client = aiowiki.Wikipedia()
+        pages = await wiki_client.opensearch(query, limit=max_results)
+        
+        results = []
+        for page in pages:
+            try:
+                summary = await page.summary()
+                url = f"https://en.wikipedia.org/wiki/{page.title.replace(' ', '_')}"
+                
+                results.append({
+                    "title": page.title,
+                    "url": url,
+                    "content": summary,
+                    "score": 0.95,  # Wikipedia results are generally high quality
+                    "source": "wikipedia"
+                })
+            except Exception as page_error:
+                print(f"Error fetching Wikipedia page {page.title}: {str(page_error)}")
+                continue
+                
+        return results
+    except Exception as e:
+        print(f"Wikipedia search failed: {str(e)}")
+        return []
+
+async def get_ddg_results(query: str, max_results: int = 3) -> List[Dict]:
+    """Get relevant results from DuckDuckGo"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Use the DuckDuckGo Instant Answer API
+            api_url = f"https://api.duckduckgo.com/?q={urllib.parse.quote(query)}&format=json"
+            async with session.get(api_url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    results = []
+                    
+                    # Process Instant Answers
+                    if data.get("AbstractText"):
+                        results.append({
+                            "title": data.get("Heading", "DuckDuckGo Result"),
+                            "url": data.get("AbstractURL", ""),
+                            "content": data["AbstractText"],
+                            "score": 0.9,
+                            "source": "duckduckgo"
+                        })
+                    
+                    # Process Related Topics
+                    for topic in data.get("RelatedTopics", [])[:max_results-1]:
+                        if isinstance(topic, dict) and "Text" in topic:
+                            results.append({
+                                "title": topic.get("FirstURL", "").split("/")[-1].replace("_", " "),
+                                "url": topic.get("FirstURL", ""),
+                                "content": topic["Text"],
+                                "score": 0.8,
+                                "source": "duckduckgo"
+                            })
+                    
+                    return results
+        return []
+    except Exception as e:
+        print(f"DuckDuckGo search failed: {str(e)}")
+        return []
+async def enhance_search_with_llm(query: str, results: List[Dict]) -> List[Dict]:
+    """Enhance search results using LLM for better ranking and filtering"""
+    if not results:
+        return results
+        
+    try:
+        # Create prompt for analysis
+        context = "\n".join([
+            f"Title: {r['title']}\nContent: {r['content'][:200]}..."
+            for r in results
+        ])
+        
+        prompt = f"""Given the search query: "{query}"
+        And these results:
+        {context}
+        
+        Analyze:
+        1. Relevance to query
+        2. Temporal relevance (if any)
+        3. Content quality
+        
+        Rate each result 0-1:"""
+        
+        inputs = qwen_tokenizer(prompt, return_tensors="pt").to(DEVICE)
+        with torch.no_grad():
+            output = qwen_model.generate(
+                **inputs,
+                max_new_tokens=200,
+                temperature=0.7,
+                do_sample=True
+            )
+            
+        analysis = qwen_tokenizer.decode(output[0], skip_special_tokens=True)
+        
+        # Extract scores from analysis
+        for result in results:
+            # Simple scoring based on keyword matching and position
+            title_score = sum(1 for word in query.lower().split() if word in result["title"].lower()) * 0.2
+            content_score = sum(1 for word in query.lower().split() if word in result["content"].lower()) * 0.1
+            result["score"] = min(1.0, result.get("score", 0) + title_score + content_score)
+            
+        # Sort by final score
+        results.sort(key=lambda x: x.get("score", 0), reverse=True)
+        
+        return results
+        
+    except Exception as e:
+        print(f"LLM enhancement failed: {str(e)}")
+        return results  # Return original results if enhancement fails
