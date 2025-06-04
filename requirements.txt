@@ -13,7 +13,7 @@ sqlalchemy==1.4.42
 torch==2.3.0 --extra-index-url https://download.pytorch.org/whl/cu121
 torchvision==0.18.0 --extra-index-url https://download.pytorch.org/whl/cu121
 torchaudio==2.3.0 --extra-index-url https://download.pytorch.org/whl/cu121
-transformers==4.40.0
+transformers[torch]==4.40.0  # Added [torch] for pipeline support
 sentence-transformers==2.2.2
 accelerate==0.27.0
 safetensors==0.4.1
@@ -26,6 +26,9 @@ numpy==1.26.3
 
 # NLP and Text Processing
 spacy==3.7.4
+spacy-legacy>=3.0.12  # Required for spacy.cli
+spacy-loggers>=1.0.5  # Required for spacy.cli
+en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl  # Default spaCy model
 nltk==3.8.1
 langdetect==1.0.9
 textblob==0.17.1
@@ -50,3 +53,5 @@ python-dotenv==1.0.0
 
 # Additional dependencies
 aiohttp==3.9.1  # Async HTTP client/server
+setuptools>=65.5.1  # Required for proper package management
+wheel>=0.38.4     # Required for building some packages
