@@ -4,7 +4,7 @@ httpx==0.26.0
 databases[sqlite]==0.8.0
 beautifulsoup4==4.12.0
 lxml==5.1.0
-trafilatura==1.6.2
+# trafilatura==1.6.2
 python-dotenv==1.0.0
 torch==2.3.0 --extra-index-url https://download.pytorch.org/whl/cu121
 torchvision==0.18.0 --extra-index-url https://download.pytorch.org/whl/cu121
