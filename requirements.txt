@@ -2,7 +2,7 @@ fastapi==0.109.1
 uvicorn[standard]==0.27.0
 httpx==0.26.0
 databases[sqlite]==0.8.0
-beautifulsoup4==4.12.0
+# beautifulsoup4==4.12.0
 lxml==5.1.0
 # trafilatura==1.6.2
 python-dotenv==1.0.0
