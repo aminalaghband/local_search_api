@@ -45,9 +45,37 @@ INDEX_NAME = "documents"
 MIN_RESULTS_FOR_REFETCH = 3
 MAX_DOCS_TO_INDEX = 50
 SEARCH_TIMEOUT = float(os.getenv("SEARCH_TIMEOUT", "10.0"))  # Seconds
+MODEL_MAX_LENGTH = 512  # Adjust based on your VRAM
+GENERATION_CONFIG = {
+    "max_new_tokens": 150,
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "do_sample": True,
+}
 
 # Initialize models with mixed precision
 semantic_model = SentenceTransformer('all-MiniLM-L6-v2').to(DEVICE)
+
+# Initialize Qwen for enhanced search understanding
+try:
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    
+    qwen_tokenizer = AutoTokenizer.from_pretrained(
+        "Qwen/Qwen1.5-0.5B-Chat",
+        trust_remote_code=True
+    )
+    qwen_model = AutoModelForCausalLM.from_pretrained(
+        "Qwen/Qwen1.5-0.5B-Chat",
+        device_map="auto",
+        trust_remote_code=True,
+        torch_dtype=torch.float16
+    )
+    print("✓ Qwen model loaded successfully")
+except Exception as e:
+    print(f"⚠️ Qwen model loading failed: {e}")
+    qwen_model = None
+    qwen_tokenizer = None
+
 summarizer = pipeline(
     "summarization", 
     model="facebook/bart-large-cnn", 
@@ -234,34 +262,36 @@ def advanced_tokenize(query: str) -> List[str]:
     return [match.group().strip('"') for match in matches if match.group()]
 
 async def expand_query(query: str, user_id: Optional[str] = None) -> str:
-    """Advanced query expansion that preserves original terms"""
+    """Advanced query expansion with proper noun and location preservation"""
     try:
         # First preserve original tokens exactly as they are
-        original_tokens = set(advanced_tokenize(query))
-        
         doc = nlp(query)
         
-        # Preserve named entities and technical terms
-        key_terms = {
-            ent.text for ent in doc.ents
-        } | {
-            token.text for token in doc 
-            if token.like_num or token.is_upper or '-' in token.text
-        }
+        # Preserve proper nouns, locations and entities with exact case
+        key_terms = set()
+        for token in doc:
+            # Keep proper nouns and location names exactly as they are
+            if (token.pos_ in ["PROPN"] or 
+                token.ent_type_ in ["GPE", "LOC", "ORG", "PERSON"] or
+                token.is_upper):
+                key_terms.add(token.text)  # Keep original case
+            else:
+                key_terms.add(token.text.lower())
         
-        expanded = original_tokens | key_terms
+        expanded = key_terms.copy()
         
-        # Only expand common words (not technical terms or entities)
+        # Only expand common words (not proper nouns or entities)
         common_words = [
             token.text.lower() for token in doc 
             if (len(token.text) > 2 and 
                 token.text not in key_terms and
+                token.pos_ not in ["PROPN"] and  # Don't expand proper nouns
+                token.ent_type_ not in ["GPE", "LOC", "ORG", "PERSON"] and  # Don't expand entities
                 not token.like_num and 
-                not token.is_upper and
-                token.text in token.text.lower())  # Only expand if case matches
+                not token.is_upper)
         ]
         
-        # Careful synonym expansion
+        # Careful synonym expansion for common words only
         for word in common_words:
             if word not in expanded:  # Don't expand terms we already have
                 syns = wordnet.synsets(word)
@@ -273,25 +303,25 @@ async def expand_query(query: str, user_id: Optional[str] = None) -> str:
                         for lemma in syn.lemmas()
                         if lemma.name().lower() != word
                     ]
-                    if lemmas and fuzz.ratio(word, lemmas[0]) > 70:  # Only add if similar
+                    if lemmas and fuzz.ratio(word, lemmas[0]) > 85:  # Increased similarity threshold
                         expanded.add(lemmas[0])
         
-        # Add user preferences if available
+        # Add user preferences if available and relevant
         if user_id:
             prefs = await database.fetch_one(
                 user_prefs.select().where(user_prefs.c.user_id == user_id)
             )
             if prefs and prefs["preferences"]:
-                # Only add relevant preferences
                 pref_terms = prefs["preferences"].get("preferred_topics", [])
                 expanded.update(
                     term for term in pref_terms
-                    if any(fuzz.partial_ratio(term, t) > 80 for t in original_tokens)
+                    if any(fuzz.partial_ratio(term, t) > 85 for t in key_terms)  # Increased threshold
                 )
         
-        # Ensure original terms are preserved in final result
-        final_terms = list(original_tokens)  # Start with original terms
-        final_terms.extend(t for t in expanded if t not in original_tokens)
+        # Ensure proper nouns and entities are at the start of results
+        final_terms = [t for t in expanded if t in key_terms]  # Original terms first
+        other_terms = [t for t in expanded if t not in key_terms]
+        final_terms.extend(other_terms)
         
         return " ".join(final_terms[:10])  # Limit expansion size
         
@@ -348,26 +378,47 @@ def generate_duckduckgo_documents(query: str) -> List[Dict[str, Any]]:
     """DuckDuckGo scraping with enhanced error handling and content extraction."""
     docs = []
     search_url = "https://html.duckduckgo.com/html/"
+    
+    # Enhance query for location searches
+    doc = nlp(query)
+    has_location = any(ent.label_ in ["GPE", "LOC"] for ent in doc.ents)
+    if has_location and "capital" in query.lower():
+        enhanced_query = query + " city capital"
+    else:
+        enhanced_query = query
+        
     client = httpx.Client(
         headers={
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9"
         },
         timeout=30.0,
         follow_redirects=True
     )
     
     try:
-        resp = client.post(search_url, data={"q": query, "kl": "us-en"})  # Add language/region hint
+        # Add region and language hints
+        resp = client.post(search_url, data={
+            "q": enhanced_query,
+            "kl": "us-en",
+            "k1": "-1",  # Disable safe search
+            "kz": "1",   # Show more results
+            "kaf": "1"   # Full content
+        })
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
         
         # Try multiple result container classes
         results = []
         for class_name in ["result", "web-result", "links_main", "result__body"]:
-            results.extend(soup.find_all("div", class_=class_name, limit=10))
+            results.extend(soup.find_all("div", class_=class_name))
             
-        for res in results[:10]:  # Limit to top 10 results
+        # Score and filter results
+        scored_results = []
+        seen_domains = set()
+        
+        for res in results:
             try:
                 # Extract link and title
                 link_tag = (res.find("a", class_="result__a") or 
@@ -379,6 +430,13 @@ def generate_duckduckgo_documents(query: str) -> List[Dict[str, Any]]:
                 link = link_tag.get("href", "")
                 if not link or link.startswith(('javascript:', 'data:', '#')):
                     continue
+                    
+                domain = get_domain(link)
+                if domain in seen_domains or not domain:
+                    continue
+                
+                if "wikipedia.org" in domain:
+                    continue  # Skip Wikipedia results here
                     
                 title = link_tag.get_text(strip=True)
                 
@@ -403,24 +461,43 @@ def generate_duckduckgo_documents(query: str) -> List[Dict[str, Any]]:
                     except Exception as e:
                         print(f"Content fetch error for {link}: {e}")
                 
-                if not content:  # Skip if no content available
+                if len(content) < 50:  # Skip if no meaningful content
                     continue
                     
+                # Score result relevance
+                relevance_score = 0
+                if has_location:
+                    # Boost geography-related domains
+                    geography_domains = ['worldatlas.com', 'britannica.com', 'nationsonline.org']
+                    if any(geo_domain in domain for geo_domain in geography_domains):
+                        relevance_score += 2
+                    
+                    # Boost results with location mentions
+                    doc_content = nlp(content[:1000])  # Limit content for NER
+                    if any(ent.label_ in ["GPE", "LOC"] for ent in doc_content.ents):
+                        relevance_score += 1
+                
                 # Extract features
                 features = gpu_extract_features(content)
                 
-                docs.append({
+                scored_results.append((relevance_score, {
                     "id": abs(hash(link)) % (10**8),
                     "title": title[:500],
                     "content": content[:10000],
                     "source": link,
-                    "source_domain": get_domain(link),
+                    "source_domain": domain,
                     **features
-                })
+                }))
+                
+                seen_domains.add(domain)
                 
             except Exception as e:
                 print(f"DuckDuckGo result processing error: {str(e)}")
                 continue
+                
+        # Sort by relevance score and convert to final format
+        scored_results.sort(reverse=True)
+        docs = [doc for score, doc in scored_results]
                 
     except Exception as e:
         print(f"DuckDuckGo search failed: {str(e)}")
@@ -482,7 +559,7 @@ async def generate_documents_async(query: str) -> List[Dict[str, Any]]:
         filtered_docs.append(doc)
         seen_domains.add(domain)
         
-        if len(filtered_docs) >= 8:  # Good number of diverse results
+        if len(filtered_docs) >= 8: # Good number of diverse results
             return filtered_docs
     
     # If we don't have enough good results, try Wikipedia as backup
@@ -631,7 +708,7 @@ async def neural_search(
     request: SearchRequest, 
     x_api_key: str = Header(...)
 ):
-    """Main search endpoint with async document fetching and improved error handling."""
+    """Main search endpoint with async document fetching and LLM enhancement"""
     if not await verify_api_key(x_api_key):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
@@ -645,6 +722,16 @@ async def neural_search(
         expanded_query = await expand_query(request.q, request.user_id)
         documents = await generate_documents_async(expanded_query)
         ranked_docs, scores = await hybrid_search(expanded_query, documents)
+        
+        # Add scores to documents
+        for doc, score in zip(ranked_docs, scores):
+            doc["score"] = float(score)
+            
+        # Enhance results with LLM if available
+        if qwen_model and len(ranked_docs) > 0:
+            ranked_docs = enhance_search_with_llm(request.q, ranked_docs)
+            scores = [doc.get("score", 0.0) for doc in ranked_docs]
+            
     except Exception as e:
         print(f"Search processing error: {str(e)}")
         raise HTTPException(
@@ -683,7 +770,8 @@ async def neural_search(
         query_analysis={
             "original": str(request.q),
             "expanded": str(expanded_query),
-            "terms": list(map(str, expanded_query.split()))
+            "terms": list(map(str, expanded_query.split())),
+            "llm_enhanced": qwen_model is not None
         },
         hardware={
             "device": str(torch.cuda.get_device_name(0)) if torch.cuda.is_available() else "CPU",
@@ -719,6 +807,72 @@ async def system_status():
         }
     }
 
-# if __name__ == "__main__":
-#     import uvicorn
-#     uvicorn.run(app, host="0.0.0.0", port=8000)
+def enhance_search_with_llm(query: str, top_results: List[Dict]) -> List[Dict]:
+    """Use Qwen to enhance search results relevance and ranking"""
+    if not qwen_model or not qwen_tokenizer or not top_results:
+        return top_results
+        
+    try:
+        # Create a prompt for result evaluation
+        prompt = f"""As a search quality evaluator, analyze these search results for the query: "{query}"
+        Rate each result's relevance from 0-10 based on:
+        1. Direct answer to the query
+        2. Information accuracy
+        3. Content quality
+        4. Source reliability
+
+        Evaluate each result briefly and assign a score.
+        """
+        
+        # Add result summaries to prompt
+        for i, doc in enumerate(top_results[:5]):  # Limit to top 5 for efficiency
+            prompt += f"\n\nResult {i+1}:\n"
+            prompt += f"Title: {doc['title']}\n"
+            prompt += f"Summary: {doc['summary'][:200]}...\n"
+        
+        # Generate evaluation with Qwen
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            inputs = qwen_tokenizer(prompt, return_tensors="pt").to(DEVICE)
+            output = qwen_model.generate(
+                **inputs,
+                max_new_tokens=GENERATION_CONFIG["max_new_tokens"],
+                temperature=GENERATION_CONFIG["temperature"],
+                top_p=GENERATION_CONFIG["top_p"],
+                do_sample=GENERATION_CONFIG["do_sample"]
+            )
+            evaluation = qwen_tokenizer.decode(output[0], skip_special_tokens=True)
+        
+        # Extract scores from evaluation
+        scores = []
+        for line in evaluation.split("\n"):
+            if "score:" in line.lower():
+                try:
+                    score = float(re.search(r"(\d+\.?\d*)", line).group(1))
+                    scores.append(min(10.0, max(0.0, score)))  # Clamp between 0-10
+                except:
+                    scores.append(5.0)  # Default score
+        
+        # Adjust result ranking based on LLM evaluation
+        if scores and len(scores) == len(top_results[:5]):
+            # Normalize scores to 0-1 range
+            max_score = max(scores)
+            min_score = min(scores)
+            score_range = max_score - min_score if max_score != min_score else 1.0
+            
+            # Apply LLM scores as ranking boost
+            for i, score in enumerate(scores):
+                normalized_score = (score - min_score) / score_range
+                if "score" in top_results[i]:
+                    # Blend with existing score (70% original, 30% LLM)
+                    top_results[i]["score"] = (
+                        0.7 * top_results[i]["score"] + 
+                        0.3 * normalized_score
+                    )
+            
+            # Re-sort results based on updated scores
+            top_results.sort(key=lambda x: x.get("score", 0), reverse=True)
+            
+    except Exception as e:
+        print(f"LLM enhancement error: {str(e)}")
+        
+    return top_results
