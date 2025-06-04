@@ -1,33 +1,48 @@
+# Standard library imports
 import asyncio
 import gc
 import json
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from typing import Dict, List, Any, Optional, Tuple
+from urllib.parse import urlparse
+
+# Deep learning and ML imports
 import torch
 from torch.cuda.amp import autocast
-import httpx
+import numpy as np
+from transformers import (
+    pipeline,
+    AutoModelForCausalLM, 
+    AutoTokenizer
+)
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+
+# NLP imports
 import spacy
 from spacy.cli import download
-import wikipedia
 import nltk
-from bs4 import BeautifulSoup
-import numpy as np
 from textblob import TextBlob
 from thefuzz import fuzz
 from nltk.corpus import wordnet
-from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
-from sklearn.metrics.pairwise import cosine_similarity
+from langdetect import detect
+
+# Web and API imports
+import httpx
+from bs4 import BeautifulSoup
+import wikipedia
+from trafilatura import fetch_url, extract
 from fastapi import FastAPI, Header, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+# Database imports
 import sqlalchemy
 import databases
-from trafilatura import fetch_url, extract
-from langdetect import detect
-import os
-from datetime import datetime
 
 # Initialize CUDA
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
