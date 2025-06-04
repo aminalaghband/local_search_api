@@ -261,69 +261,126 @@ def advanced_tokenize(query: str) -> List[str]:
     matches = re.finditer(pattern, query)
     return [match.group().strip('"') for match in matches if match.group()]
 
+def analyze_query_type(query: str) -> Dict[str, Any]:
+    """Analyze query to determine type and extract key information"""
+    doc = nlp(query)
+    
+    # Initialize analysis
+    analysis = {
+        "is_question": False,
+        "question_type": None,
+        "key_entities": [],
+        "target_concepts": set(),
+        "temporal_context": "current"  # default to current
+    }
+    
+    # Detect questions
+    question_words = {"who", "what", "when", "where", "why", "how", "which"}
+    first_word = doc[0].text.lower()
+    if first_word in question_words or "?" in query:
+        analysis["is_question"] = True
+        analysis["question_type"] = first_word
+    
+    # Extract entities and concepts
+    for ent in doc.ents:
+        if ent.label_ in ["PERSON", "ORG", "GPE", "LOC"]:
+            analysis["key_entities"].append({
+                "text": ent.text,
+                "type": ent.label_
+            })
+    
+    # Detect temporal context
+    time_indicators = {
+        "latest": "current",
+        "current": "current",
+        "now": "current",
+        "present": "current",
+        "previous": "past",
+        "former": "past",
+        "last": "past",
+        "recent": "current"
+    }
+    
+    query_tokens = query.lower().split()
+    for token in query_tokens:
+        if token in time_indicators:
+            analysis["temporal_context"] = time_indicators[token]
+    
+    # Extract key concepts
+    analysis["target_concepts"].update([
+        token.lemma_.lower() for token in doc
+        if token.pos_ in ["NOUN", "VERB"] and len(token.text) > 2
+    ])
+    
+    return analysis
+
 async def expand_query(query: str, user_id: Optional[str] = None) -> str:
-    """Advanced query expansion with proper noun and location preservation"""
+    """Enhanced query expansion with question understanding"""
     try:
-        # First preserve original tokens exactly as they are
+        # Analyze query type and structure
+        query_analysis = analyze_query_type(query)
         doc = nlp(query)
         
-        # Preserve proper nouns, locations and entities with exact case
-        key_terms = set()
+        # Initialize terms with different priorities
+        essential_terms = set()  # Must-have terms
+        context_terms = set()    # Important context
+        optional_terms = set()   # Nice-to-have expansions
+        
+        # Handle question-type queries
+        if query_analysis["is_question"]:
+            # For "who" questions about current roles
+            if (query_analysis["question_type"] == "who" and 
+                query_analysis["temporal_context"] == "current"):
+                essential_terms.add("current")
+                essential_terms.add("incumbent")
+                if "president" in query.lower():
+                    essential_terms.add("president")
+                    context_terms.add("administration")
+                    context_terms.add("elected")
+        
+        # Process entities and maintain case
         for token in doc:
-            # Keep proper nouns and location names exactly as they are
             if (token.pos_ in ["PROPN"] or 
                 token.ent_type_ in ["GPE", "LOC", "ORG", "PERSON"] or
                 token.is_upper):
-                key_terms.add(token.text)  # Keep original case
-            else:
-                key_terms.add(token.text.lower())
+                essential_terms.add(token.text)  # Keep original case
+            elif len(token.text) > 2:  # Meaningful common words
+                context_terms.add(token.text.lower())
         
-        expanded = key_terms.copy()
+        # Add entity information
+        for entity in query_analysis["key_entities"]:
+            essential_terms.add(entity["text"])
         
-        # Only expand common words (not proper nouns or entities)
-        common_words = [
-            token.text.lower() for token in doc 
-            if (len(token.text) > 2 and 
-                token.text not in key_terms and
-                token.pos_ not in ["PROPN"] and  # Don't expand proper nouns
-                token.ent_type_ not in ["GPE", "LOC", "ORG", "PERSON"] and  # Don't expand entities
-                not token.like_num and 
-                not token.is_upper)
-        ]
-        
-        # Careful synonym expansion for common words only
-        for word in common_words:
-            if word not in expanded:  # Don't expand terms we already have
+        # Careful synonym expansion only for context terms
+        for word in context_terms.copy():
+            if word not in essential_terms:
                 syns = wordnet.synsets(word)
                 if syns:
-                    # Add only the most relevant synonym if similarity is high
+                    # Add only highly relevant synonyms
                     syn = syns[0]
                     lemmas = [
                         lemma.name().replace('_', ' ') 
                         for lemma in syn.lemmas()
                         if lemma.name().lower() != word
                     ]
-                    if lemmas and fuzz.ratio(word, lemmas[0]) > 85:  # Increased similarity threshold
-                        expanded.add(lemmas[0])
+                    if lemmas and fuzz.ratio(word, lemmas[0]) > 85:
+                        optional_terms.add(lemmas[0])
         
-        # Add user preferences if available and relevant
-        if user_id:
-            prefs = await database.fetch_one(
-                user_prefs.select().where(user_prefs.c.user_id == user_id)
-            )
-            if prefs and prefs["preferences"]:
-                pref_terms = prefs["preferences"].get("preferred_topics", [])
-                expanded.update(
-                    term for term in pref_terms
-                    if any(fuzz.partial_ratio(term, t) > 85 for t in key_terms)  # Increased threshold
-                )
+        # Build final query with term priorities
+        final_terms = list(essential_terms)  # Essential terms first
+        final_terms.extend(t for t in context_terms if t not in essential_terms)
+        final_terms.extend(t for t in optional_terms if t not in essential_terms and t not in context_terms)
         
-        # Ensure proper nouns and entities are at the start of results
-        final_terms = [t for t in expanded if t in key_terms]  # Original terms first
-        other_terms = [t for t in expanded if t not in key_terms]
-        final_terms.extend(other_terms)
+        # Limit total terms but ensure all essential terms are included
+        max_terms = 10
+        if len(final_terms) > max_terms:
+            preserved_terms = list(essential_terms)
+            remaining_slots = max_terms - len(preserved_terms)
+            if remaining_slots > 0:
+                preserved_terms.extend(final_terms[len(essential_terms):len(essential_terms) + remaining_slots])
+            final_terms = preserved_terms
         
-        return " ".join(final_terms[:10])  # Limit expansion size
+        return " ".join(final_terms)
         
     except Exception as e:
         print(f"Query expansion error: {str(e)}")
@@ -375,17 +432,25 @@ async def expand_query(query: str, user_id: Optional[str] = None) -> str:
     return " ".join(list(expanded)[:10])
 
 def generate_duckduckgo_documents(query: str) -> List[Dict[str, Any]]:
-    """DuckDuckGo scraping with enhanced error handling and content extraction."""
+    """Enhanced DuckDuckGo scraping with factual query handling"""
     docs = []
     search_url = "https://html.duckduckgo.com/html/"
     
-    # Enhance query for location searches
-    doc = nlp(query)
-    has_location = any(ent.label_ in ["GPE", "LOC"] for ent in doc.ents)
-    if has_location and "capital" in query.lower():
-        enhanced_query = query + " city capital"
-    else:
-        enhanced_query = query
+    # Analyze query type
+    query_analysis = analyze_query_type(query)
+    enhanced_query = query
+
+    # Enhance query based on type
+    if query_analysis["is_question"]:
+        if query_analysis["question_type"] == "who":
+            if "president" in query.lower() and query_analysis["temporal_context"] == "current":
+                enhanced_query = f"current incumbent {query}"
+        elif query_analysis["question_type"] == "when":
+            enhanced_query = f"date time {query}"
+            
+    # Additional context for temporal queries
+    if query_analysis["temporal_context"] == "current":
+        enhanced_query += " 2025 current incumbent"
         
     client = httpx.Client(
         headers={
@@ -398,7 +463,7 @@ def generate_duckduckgo_documents(query: str) -> List[Dict[str, Any]]:
     )
     
     try:
-        # Add region and language hints
+        # Add search parameters
         resp = client.post(search_url, data={
             "q": enhanced_query,
             "kl": "us-en",
@@ -409,18 +474,17 @@ def generate_duckduckgo_documents(query: str) -> List[Dict[str, Any]]:
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
         
-        # Try multiple result container classes
-        results = []
-        for class_name in ["result", "web-result", "links_main", "result__body"]:
-            results.extend(soup.find_all("div", class_=class_name))
-            
         # Score and filter results
         scored_results = []
         seen_domains = set()
         
+        # Try multiple result containers
+        results = []
+        for class_name in ["result", "web-result", "links_main", "result__body"]:
+            results.extend(soup.find_all("div", class_=class_name))
+            
         for res in results:
             try:
-                # Extract link and title
                 link_tag = (res.find("a", class_="result__a") or 
                           res.find("a", class_="web-result__title") or
                           res.find("a", href=True))
@@ -435,12 +499,9 @@ def generate_duckduckgo_documents(query: str) -> List[Dict[str, Any]]:
                 if domain in seen_domains or not domain:
                     continue
                 
-                if "wikipedia.org" in domain:
-                    continue  # Skip Wikipedia results here
-                    
                 title = link_tag.get_text(strip=True)
                 
-                # Extract snippet/description
+                # Extract content
                 snippet = None
                 for snippet_class in ["result__snippet", "web-result__snippet", "result__body"]:
                     snippet_tag = res.find("div", class_=snippet_class)
@@ -450,8 +511,35 @@ def generate_duckduckgo_documents(query: str) -> List[Dict[str, Any]]:
                         
                 content = snippet or ""
                 
-                # Try to fetch full content if snippet is short
-                if len(content) < 100:
+                # For factual queries, prefer recent and authoritative sources
+                relevance_score = 0
+                
+                # Boost authoritative domains
+                authority_domains = {
+                    'wikipedia.org': 3,
+                    'whitehouse.gov': 5,
+                    'senate.gov': 4,
+                    'house.gov': 4,
+                    'state.gov': 4,
+                    'ap.org': 3,
+                    'reuters.com': 3,
+                    'bbc.com': 3,
+                    'nytimes.com': 3
+                }
+                
+                for auth_domain, score in authority_domains.items():
+                    if auth_domain in domain:
+                        relevance_score += score
+                        break
+                
+                # Boost results with recent dates for current queries
+                if query_analysis["temporal_context"] == "current":
+                    current_year = "2025"
+                    if current_year in content[:200]:  # Check start of content
+                        relevance_score += 2
+                        
+                # Try to fetch full content for promising results
+                if (len(content) < 100 and relevance_score > 0) or len(content) < 50:
                     try:
                         downloaded = fetch_url(link, timeout=5.0)
                         if downloaded:
@@ -464,19 +552,6 @@ def generate_duckduckgo_documents(query: str) -> List[Dict[str, Any]]:
                 if len(content) < 50:  # Skip if no meaningful content
                     continue
                     
-                # Score result relevance
-                relevance_score = 0
-                if has_location:
-                    # Boost geography-related domains
-                    geography_domains = ['worldatlas.com', 'britannica.com', 'nationsonline.org']
-                    if any(geo_domain in domain for geo_domain in geography_domains):
-                        relevance_score += 2
-                    
-                    # Boost results with location mentions
-                    doc_content = nlp(content[:1000])  # Limit content for NER
-                    if any(ent.label_ in ["GPE", "LOC"] for ent in doc_content.ents):
-                        relevance_score += 1
-                
                 # Extract features
                 features = gpu_extract_features(content)
                 
@@ -486,16 +561,21 @@ def generate_duckduckgo_documents(query: str) -> List[Dict[str, Any]]:
                     "content": content[:10000],
                     "source": link,
                     "source_domain": domain,
+                    "query_match": {
+                        "is_question": query_analysis["is_question"],
+                        "question_type": query_analysis["question_type"],
+                        "temporal_context": query_analysis["temporal_context"]
+                    },
                     **features
                 }))
                 
                 seen_domains.add(domain)
                 
             except Exception as e:
-                print(f"DuckDuckGo result processing error: {str(e)}")
+                print(f"Result processing error: {str(e)}")
                 continue
                 
-        # Sort by relevance score and convert to final format
+        # Sort by relevance score and return
         scored_results.sort(reverse=True)
         docs = [doc for score, doc in scored_results]
                 
@@ -808,29 +888,64 @@ async def system_status():
     }
 
 def enhance_search_with_llm(query: str, top_results: List[Dict]) -> List[Dict]:
-    """Use Qwen to enhance search results relevance and ranking"""
+    """Enhanced LLM-based result evaluation with factual query handling"""
     if not qwen_model or not qwen_tokenizer or not top_results:
         return top_results
         
     try:
-        # Create a prompt for result evaluation
-        prompt = f"""As a search quality evaluator, analyze these search results for the query: "{query}"
-        Rate each result's relevance from 0-10 based on:
-        1. Direct answer to the query
-        2. Information accuracy
-        3. Content quality
-        4. Source reliability
-
-        Evaluate each result briefly and assign a score.
-        """
+        # Analyze query type
+        query_analysis = analyze_query_type(query)
+        
+        # Create a context-aware prompt
+        if query_analysis["is_question"]:
+            if query_analysis["temporal_context"] == "current":
+                prompt = f"""As a search evaluator in 2025, analyze these results for the question: "{query}"
+                Focus on:
+                1. Current and up-to-date information (as of 2025)
+                2. Direct answers to the question
+                3. Source authority and reliability
+                4. Factual accuracy
+                
+                For each result, determine:
+                1. Does it directly answer the question? (0-10)
+                2. Is the information current? (0-10)
+                3. Is the source authoritative? (0-10)
+                
+                Evaluate each result and assign a combined score (0-10).
+                """
+            else:
+                prompt = f"""As a search evaluator, analyze these results for the question: "{query}"
+                Focus on:
+                1. Direct answers to the question
+                2. Source authority and reliability
+                3. Factual accuracy and detail
+                4. Historical context when relevant
+                
+                For each result, determine:
+                1. Does it directly answer the question? (0-10)
+                2. Is the source authoritative? (0-10)
+                3. Is the information complete? (0-10)
+                
+                Evaluate each result and assign a combined score (0-10).
+                """
+        else:
+            prompt = f"""As a search evaluator, analyze these results for the query: "{query}"
+            Focus on:
+            1. Relevance to the query
+            2. Information quality and completeness
+            3. Source reliability
+            
+            Rate each result's relevance from 0-10.
+            """
         
         # Add result summaries to prompt
-        for i, doc in enumerate(top_results[:5]):  # Limit to top 5 for efficiency
+        for i, doc in enumerate(top_results[:5]):
             prompt += f"\n\nResult {i+1}:\n"
             prompt += f"Title: {doc['title']}\n"
+            prompt += f"Source: {doc['source_domain']}\n"
             prompt += f"Summary: {doc['summary'][:200]}...\n"
         
-        # Generate evaluation with Qwen
+        # Generate evaluation
         with torch.no_grad(), torch.cuda.amp.autocast():
             inputs = qwen_tokenizer(prompt, return_tensors="pt").to(DEVICE)
             output = qwen_model.generate(
@@ -842,34 +957,40 @@ def enhance_search_with_llm(query: str, top_results: List[Dict]) -> List[Dict]:
             )
             evaluation = qwen_tokenizer.decode(output[0], skip_special_tokens=True)
         
-        # Extract scores from evaluation
+        # Extract scores and boost factual answers
         scores = []
         for line in evaluation.split("\n"):
-            if "score:" in line.lower():
+            if "score:" in line.lower() or "combined:" in line.lower():
                 try:
                     score = float(re.search(r"(\d+\.?\d*)", line).group(1))
-                    scores.append(min(10.0, max(0.0, score)))  # Clamp between 0-10
+                    scores.append(min(10.0, max(0.0, score)))
                 except:
-                    scores.append(5.0)  # Default score
+                    scores.append(5.0)
         
-        # Adjust result ranking based on LLM evaluation
+        # Adjust result ranking
         if scores and len(scores) == len(top_results[:5]):
-            # Normalize scores to 0-1 range
+            # Normalize scores
             max_score = max(scores)
             min_score = min(scores)
             score_range = max_score - min_score if max_score != min_score else 1.0
             
-            # Apply LLM scores as ranking boost
+            # Apply scores with factual query boost
             for i, score in enumerate(scores):
                 normalized_score = (score - min_score) / score_range
-                if "score" in top_results[i]:
-                    # Blend with existing score (70% original, 30% LLM)
-                    top_results[i]["score"] = (
-                        0.7 * top_results[i]["score"] + 
-                        0.3 * normalized_score
-                    )
+                original_score = top_results[i].get("score", 0)
+                
+                # Higher LLM weight for factual queries
+                if query_analysis["is_question"]:
+                    llm_weight = 0.4  # 40% LLM, 60% original for factual queries
+                else:
+                    llm_weight = 0.3  # 30% LLM, 70% original for other queries
+                    
+                top_results[i]["score"] = (
+                    (1 - llm_weight) * original_score + 
+                    llm_weight * normalized_score
+                )
             
-            # Re-sort results based on updated scores
+            # Re-sort results
             top_results.sort(key=lambda x: x.get("score", 0), reverse=True)
             
     except Exception as e:
